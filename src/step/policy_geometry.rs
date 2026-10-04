@@ -40,6 +40,13 @@
 //! boundaries are all eligible, avoiding a dense-interior/coarse-boundary
 //! mismatch on mixed neighborhoods. Because the whole connected neighborhood
 //! uses one policy per edge, adjacency stays crack-free.
+//! A newly admitted shell containing a source-signed torus can include tori in
+//! that target set only when the entire shell uses these analytic carriers.
+//! Its positive companion tori share the same sampling policy; both native
+//! angular axes receive compatible floors. Shells without signed tori and
+//! mixed sphere/spline shells keep 0.38 torus sampling.
+
+use std::collections::{HashMap, HashSet};
 
 use truck_meshalgo::prelude::{
     BoundedCurve, BoundedSurface, D2, ParameterDivision1D, ParameterDivision2D, ParameterRange,
@@ -193,7 +200,7 @@ impl ParameterDivision1D for PolicyCurve {
 /// unchanged and overrides [`ParameterDivision2D`] to hold the circumferential
 /// direction of cylindrical and conical surfaces to the policy's angular floor
 /// — but only when [`interior_eligible`](Self::new) is set, i.e. the face is a
-/// cylinder/cone whose circular boundaries are all eligible. Otherwise the
+/// cylinder/cone or torus in a recovered analytic shell whose circular boundaries are eligible. Otherwise the
 /// surface divides at the baseline tolerance, preserving the
 /// dense-interior/coarse-boundary match.
 /// A per-axis quotient map from cover (deck-lifted) coordinates to the native
@@ -234,7 +241,7 @@ impl QuotientAxis {
 /// unchanged and overrides [`ParameterDivision2D`] to hold the circumferential
 /// direction of cylindrical and conical surfaces to the policy's angular floor
 /// — but only when [`interior_eligible`](Self::new) is set, i.e. the face is a
-/// cylinder/cone whose circular boundaries are all eligible. Otherwise the
+/// cylinder/cone or torus in a recovered analytic shell whose circular boundaries are eligible. Otherwise the
 /// surface divides at the baseline tolerance, preserving the
 /// dense-interior/coarse-boundary match.
 ///
@@ -498,7 +505,21 @@ impl ParameterDivision2D for PolicySurface {
         // the angular floor then lifts the circumferential count if the linear
         // term left it below the policy's proportional share of a revolution.
         let capped_tol = tol.min(self.policy.maximum_absolute_deflection);
-        let (udiv, vdiv) = self.inner.parameter_division(range, capped_tol);
+        let (mut udiv, mut vdiv) = self.inner.parameter_division(range, capped_tol);
+        if matches!(
+            self.inner,
+            Surface::ElementarySurface(ElementarySurface::ToroidalSurface(_))
+        ) {
+            // Only tori in recovered analytic shells can be eligible here. Both native angular
+            // axes must follow their refined shared circular boundaries.
+            for (division, (min, max)) in [(&mut udiv, range.0), (&mut vdiv, range.1)] {
+                let needed = self.policy.surface_floor_segments(max - min);
+                if needed >= 2 && division.len() < needed {
+                    *division = uniform_linspace(min, max, needed);
+                }
+            }
+            return (udiv, vdiv);
+        }
         let (v_min, v_max) = range.1;
         let needed = self.policy.surface_floor_segments(v_max - v_min);
         if needed >= 2 && vdiv.len() < needed {
@@ -648,7 +669,46 @@ struct Eligibility {
 }
 
 impl Eligibility {
+    #[cfg(test)]
     fn compute(shell: &CompressedShell<Point3, Curve3D, Surface>) -> Self {
+        Self::with_signed_tori(shell, &HashSet::new())
+    }
+
+    fn with_signed_tori(
+        shell: &CompressedShell<Point3, Curve3D, Surface>,
+        signed_torus_surfaces: &HashSet<u64>,
+    ) -> Self {
+        // A signed torus makes this shell newly admissible. Refine its whole
+        // analytic torus neighborhood, including positive companion carriers;
+        // refining only the signed face leaves their shared outer outline at
+        // the coarse assembly tolerance. Mixed spline/sphere shells keep the
+        // old sampling because their triangulation is density-sensitive.
+        let recovered_analytic_shell = shell.faces.iter().any(|face| {
+            face.provenance
+                .surface_id
+                .is_some_and(|id| signed_torus_surfaces.contains(&id.get()))
+                && matches!(
+                    face.surface,
+                    Surface::ElementarySurface(ElementarySurface::ToroidalSurface(_))
+                )
+        }) && shell.faces.iter().all(|face| {
+            is_target_surface(&face.surface)
+                || matches!(
+                    face.surface,
+                    Surface::ElementarySurface(ElementarySurface::ToroidalSurface(_))
+                )
+        });
+        let recovered_torus_faces: Vec<bool> = shell
+            .faces
+            .iter()
+            .map(|face| {
+                recovered_analytic_shell
+                    && matches!(
+                        face.surface,
+                        Surface::ElementarySurface(ElementarySurface::ToroidalSurface(_))
+                    )
+            })
+            .collect();
         // Map each edge index to the faces that reference it. A face references
         // an edge once per boundary loop occurrence; collecting duplicates is
         // harmless for the all-targets check.
@@ -672,17 +732,18 @@ impl Eligibility {
                 if circular_radius(&edge.curve).is_none() {
                     return false;
                 }
-                edge_faces[e]
-                    .iter()
-                    .all(|&f| is_target_surface(&shell.faces[f].surface))
+                edge_faces[e].iter().all(|&f| {
+                    is_target_surface(&shell.faces[f].surface) || recovered_torus_faces[f]
+                })
             })
             .collect();
 
         let face_interior_eligible: Vec<bool> = shell
             .faces
             .iter()
-            .map(|face| {
-                if !is_revolved_target(&face.surface) {
+            .enumerate()
+            .map(|(f, face)| {
+                if !is_revolved_target(&face.surface) && !recovered_torus_faces[f] {
                     return false;
                 }
                 // The interior floor applies only when every circular boundary
@@ -722,7 +783,7 @@ pub fn wrap_shell(
     shell: CompressedShell<Point3, Curve3D, Surface>,
     policy: MeshingPolicy,
 ) -> CompressedShell<Point3, PolicyCurve, PolicySurface> {
-    wrap_shell_with_closure(shell, policy, &std::collections::HashMap::new())
+    wrap_shell_with_closure(shell, policy, &HashMap::new())
 }
 
 /// As [`wrap_shell`], additionally attaching each face's source-declared
@@ -737,9 +798,22 @@ pub fn wrap_shell(
 pub fn wrap_shell_with_closure(
     shell: CompressedShell<Point3, Curve3D, Surface>,
     policy: MeshingPolicy,
-    closure_map: &std::collections::HashMap<u64, SplineAxisClosure>,
+    closure_map: &HashMap<u64, SplineAxisClosure>,
 ) -> CompressedShell<Point3, PolicyCurve, PolicySurface> {
-    let eligibility = Eligibility::compute(&shell);
+    wrap_shell_with_source_metadata(shell, policy, closure_map, &HashSet::new())
+}
+
+/// Carry source closure and signed-major torus identity into the shared policy.
+/// Newly admitted, entirely analytic shells containing a signed torus use the
+/// same angular floor on their torus carriers and stable neighboring faces.
+/// Other torus neighborhoods keep 0.38 sampling.
+pub fn wrap_shell_with_source_metadata(
+    shell: CompressedShell<Point3, Curve3D, Surface>,
+    policy: MeshingPolicy,
+    closure_map: &HashMap<u64, SplineAxisClosure>,
+    signed_torus_surfaces: &HashSet<u64>,
+) -> CompressedShell<Point3, PolicyCurve, PolicySurface> {
+    let eligibility = Eligibility::with_signed_tori(&shell, signed_torus_surfaces);
     CompressedShell {
         vertices: shell.vertices,
         edges: shell
@@ -833,10 +907,61 @@ mod quotient_tests {
             wrapped.faces[0].surface.parameter_division(range, 1.0),
             shell.faces[0].surface.parameter_division(range, 1.0),
         );
+        // Source provenance enables the floor for a newly admitted analytic
+        // shell, preserving its canonical shared edges.
+        shell.faces[0].provenance.surface_id =
+            Some(truck_topology::compress::SourceEntityId::new(7));
+        let signed = wrap_shell_with_source_metadata(
+            shell.clone(),
+            MeshingPolicy::DEFAULT,
+            &HashMap::new(),
+            &HashSet::from([7]),
+        );
+        let (parameters, _) = signed.edges[0].curve.parameter_division(range.0, 1.0);
+        assert!(parameters.len() - 1 >= MeshingPolicy::DEFAULT.angular_floor_segments());
+        let (u, v) = signed.faces[0].surface.parameter_division(range, 1.0);
+        assert!(u.len() >= MeshingPolicy::DEFAULT.angular_floor_segments());
+        assert!(v.len() >= MeshingPolicy::DEFAULT.angular_floor_segments());
+        // A positive companion torus in this recovered shell uses the same
+        // floor. Without a source-signed carrier the identical shell retains
+        // baseline sampling.
+        let mut companion = shell.faces[0].clone();
+        companion.provenance.surface_id = Some(truck_topology::compress::SourceEntityId::new(8));
+        shell.faces.push(companion);
+        assert!(
+            Eligibility::with_signed_tori(&shell, &HashSet::from([7]))
+                .face_interior_eligible
+                .iter()
+                .all(|eligible| *eligible)
+        );
+        assert!(
+            Eligibility::compute(&shell)
+                .face_interior_eligible
+                .iter()
+                .all(|eligible| !eligible)
+        );
         shell.faces[0].surface = Surface::ElementarySurface(ElementarySurface::Sphere(
             Processor::new(StepSphere(Sphere::new(Point3::new(0.0, 0.0, 0.0), 4.25))),
         ));
         assert!(!Eligibility::compute(&shell).edge_eligible[0]);
+        let mixed = Eligibility::with_signed_tori(&shell, &HashSet::from([8]));
+        assert!(!mixed.edge_eligible[0]);
+        assert!(!mixed.face_interior_eligible[1]);
+        shell.faces[0].surface = closed_v_spline();
+        let mixed_spline = wrap_shell_with_source_metadata(
+            shell.clone(),
+            MeshingPolicy::DEFAULT,
+            &HashMap::new(),
+            &HashSet::from([8]),
+        );
+        assert_eq!(
+            mixed_spline.edges[0].curve.parameter_division(range.0, 1.0),
+            shell.edges[0].curve.parameter_division(range.0, 1.0)
+        );
+        assert_eq!(
+            mixed_spline.faces[1].surface.parameter_division(range, 1.0),
+            shell.faces[1].surface.parameter_division(range, 1.0)
+        );
     }
 
     /// A degree-2 clamped spline over `[0,1]^2` whose `v` direction is a

@@ -19,7 +19,7 @@ pub mod spline_carrier;
 mod tessellated;
 pub mod torus_deck;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Instant;
 
 use rayon::prelude::*;
@@ -271,6 +271,21 @@ pub fn parse_step_scene_with_stats(
     }
 }
 
+// Preserve source sign before carrier conversion takes the absolute radius.
+fn signed_torus_surface_ids(table: &Table) -> HashSet<u64> {
+    table
+        .toroidal_surface
+        .iter()
+        .filter_map(|(&id, torus)| {
+            (torus.major_radius.is_finite()
+                && torus.major_radius < 0.0
+                && torus.minor_radius.is_finite()
+                && torus.minor_radius > 0.0)
+                .then_some(id)
+        })
+        .collect()
+}
+
 /// Tessellate every shell in a STEP file into one indexed triangle mesh.
 ///
 /// Positions carry no shared topology between faces, so each triangle brings
@@ -342,6 +357,7 @@ fn parse_step_table(
     // entity id, the same id `FaceProvenance.surface_id` carries per face, so
     // `wrap_shell_with_closure` can attach it to each face's `PolicySurface`.
     let closure_map = lattice::spline_closure_map(&table);
+    let signed_torus_surfaces = signed_torus_surface_ids(&table);
 
     // Effective face appearance, keyed by the source face entity id —
     // `FaceProvenance.definition_id`. Resolved before any shell is converted so
@@ -436,7 +452,14 @@ fn parse_step_table(
         .into_par_iter()
         .map(|shell| {
             let (declared, shell) = shell?;
-            mesh_shell(declared, shell, tolerance, &closure_map, policy)
+            mesh_shell(
+                declared,
+                shell,
+                tolerance,
+                &closure_map,
+                &signed_torus_surfaces,
+                policy,
+            )
         })
         .collect::<Vec<_>>();
     timings.record("step_tessellate", mesh_started.elapsed());
@@ -664,6 +687,7 @@ fn mesh_shell(
     shell: CompressedShell<Point3, Curve3D, Surface>,
     tolerance: f64,
     closure_map: &std::collections::HashMap<u64, lattice::SplineAxisClosure>,
+    signed_torus_surfaces: &HashSet<u64>,
     policy: meshing_policy::MeshingPolicy,
 ) -> Result<StepShellMesh, String> {
     // Only a shell with no faces carries nothing to render. Counting
@@ -705,20 +729,25 @@ fn mesh_shell(
     // line after constructing it. The reasons now arrive beside the
     // shell, so a face that produced nothing can say why rather than
     // being inferred from the shape of its absence.
-    let outcome = policy_geometry::wrap_shell_with_closure(shell, policy, closure_map)
-        .robust_triangulation_with_torus_outcome(
-            tolerance,
-            |s: &policy_geometry::PolicySurface| {
-                lattice::lattice_of_with_closure(s.inner(), s.source_closure())
-            },
-            |s: &policy_geometry::PolicySurface| lattice::support_schema_of(s.inner()),
-            |c: &policy_geometry::PolicyCurve| lattice::curve_schema_of(c.inner()),
-            |s: &policy_geometry::PolicySurface| cylinder::identify_source_cylinder_opt(s.inner()),
-            |c: &policy_geometry::PolicyCurve| lattice::cylinder_curve_schema_of(c.inner()),
-            |c: &policy_geometry::PolicyCurve| lattice::cylinder_curve_family_of(c.inner()),
-            |s: &policy_geometry::PolicySurface| cone::identify_source_cone_opt(s.inner()),
-            |s: &policy_geometry::PolicySurface| torus_deck::identify_source_torus_opt(s.inner()),
-        );
+    let outcome = policy_geometry::wrap_shell_with_source_metadata(
+        shell,
+        policy,
+        closure_map,
+        signed_torus_surfaces,
+    )
+    .robust_triangulation_with_torus_outcome(
+        tolerance,
+        |s: &policy_geometry::PolicySurface| {
+            lattice::lattice_of_with_closure(s.inner(), s.source_closure())
+        },
+        |s: &policy_geometry::PolicySurface| lattice::support_schema_of(s.inner()),
+        |c: &policy_geometry::PolicyCurve| lattice::curve_schema_of(c.inner()),
+        |s: &policy_geometry::PolicySurface| cylinder::identify_source_cylinder_opt(s.inner()),
+        |c: &policy_geometry::PolicyCurve| lattice::cylinder_curve_schema_of(c.inner()),
+        |c: &policy_geometry::PolicyCurve| lattice::cylinder_curve_family_of(c.inner()),
+        |s: &policy_geometry::PolicySurface| cone::identify_source_cone_opt(s.inner()),
+        |s: &policy_geometry::PolicySurface| torus_deck::identify_source_torus_opt(s.inner()),
+    );
     let meshed = outcome.shell;
     // A face that could not be meshed is dropped from the polygon
     // without comment, so count them here while the structure still
@@ -920,6 +949,7 @@ fn tessellate_definitions(
     stats: &mut StepImportStats,
 ) -> anyhow::Result<StepAssemblyScene> {
     let closure_map = lattice::spline_closure_map(&table);
+    let signed_torus_surfaces = signed_torus_surface_ids(&table);
     let (face_appearances, unresolved_styles) = appearance::resolve_face_appearances(&table);
     let mut structure_errors = Vec::new();
     // Per node (in graph index order): the definition's source shell entity
@@ -1016,7 +1046,14 @@ fn tessellate_definitions(
         .map(|(shell_id, declared, shell)| {
             (
                 shell_id,
-                mesh_shell(declared, shell, tolerance, &closure_map, policy),
+                mesh_shell(
+                    declared,
+                    shell,
+                    tolerance,
+                    &closure_map,
+                    &signed_torus_surfaces,
+                    policy,
+                ),
             )
         })
         .collect::<HashMap<_, _>>();
