@@ -1,6 +1,16 @@
 use super::*;
 use crate::common::PartAttrs;
 
+// Constructors elsewhere in the kernel can still assert on unusual geometry.
+// Conversion is transactional: a panic refuses this entity, before its arena
+// position is claimed, so neighboring source faces remain loadable.
+fn geometry_conversion<T>(convert: impl FnOnce() -> Option<T>) -> Option<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(convert)).unwrap_or_else(|_| {
+        eprintln!("STEP geometry conversion panicked; refusing the source entity");
+        None
+    })
+}
+
 impl Table {
     fn place_holder_edge_any_to_index_and_edge_curve(
         &self,
@@ -130,32 +140,34 @@ impl Table {
             .filter_map(move |edge| self.place_holder_edge_any_to_index_and_edge_curve(&edge));
         for (idx, edge) in edge_curves {
             arena.get_or_try_insert(EdgeCurveId::new(idx), move || {
-                let edge_curve = edge
-                    .clone()
-                    .into_owned(self)
-                    .map_err(|e| eprintln!("{e}"))
-                    .ok()?;
-                let curve = edge_curve
-                    .parse_curve3d()
-                    .map_err(|e| eprintln!("{e}"))
-                    .ok()?;
-                let Ref(Name::Entity(front_idx)) = edge.edge_start else {
-                    return None;
-                };
-                let Ref(Name::Entity(back_idx)) = edge.edge_end else {
-                    return None;
-                };
-                // An edge whose endpoints did not convert is not an edge. The
-                // bare `usize` pair is what `CompressedEdge` demands, so this is
-                // one of the few places a `VertexIndex` has to be unwrapped, and
-                // it happens only after the lookup proved the vertex exists.
-                let endpoints = (
-                    vertices.index_of(VertexPointId::new(front_idx))?.position(),
-                    vertices.index_of(VertexPointId::new(back_idx))?.position(),
-                );
-                Some(CompressedEdge {
-                    vertices: endpoints,
-                    curve,
+                geometry_conversion(|| {
+                    let edge_curve = edge
+                        .clone()
+                        .into_owned(self)
+                        .map_err(|e| eprintln!("{e}"))
+                        .ok()?;
+                    let curve = edge_curve
+                        .parse_curve3d_for_tessellation()
+                        .map_err(|e| eprintln!("{e}"))
+                        .ok()?;
+                    let Ref(Name::Entity(front_idx)) = edge.edge_start else {
+                        return None;
+                    };
+                    let Ref(Name::Entity(back_idx)) = edge.edge_end else {
+                        return None;
+                    };
+                    // An edge whose endpoints did not convert is not an edge. The
+                    // bare `usize` pair is what `CompressedEdge` demands, so this is
+                    // one of the few places a `VertexIndex` has to be unwrapped, and
+                    // it happens only after the lookup proved the vertex exists.
+                    let endpoints = (
+                        vertices.index_of(VertexPointId::new(front_idx))?.position(),
+                        vertices.index_of(VertexPointId::new(back_idx))?.position(),
+                    );
+                    Some(CompressedEdge {
+                        vertices: endpoints,
+                        curve,
+                    })
                 })
             });
         }
@@ -299,15 +311,17 @@ impl Table {
         surfaces: &mut Arena<SurfaceKind, Surface>,
     ) -> Option<(Surface, Option<u64>)> {
         let convert = || {
-            let step_surface: SurfaceAny = face
-                .face_geometry
-                .clone()
-                .into_owned(self)
-                .map_err(|e| eprintln!("{e}"))
-                .ok()?;
-            Surface::try_from(&step_surface)
-                .map_err(|e| eprintln!("{e}"))
-                .ok()
+            geometry_conversion(|| {
+                let step_surface: SurfaceAny = face
+                    .face_geometry
+                    .clone()
+                    .into_owned(self)
+                    .map_err(|e| eprintln!("{e}"))
+                    .ok()?;
+                Surface::try_from(&step_surface)
+                    .map_err(|e| eprintln!("{e}"))
+                    .ok()
+            })
         };
         // An inline owned surface has no entity id, so there is no identity to
         // be canonical about: it belongs to this face alone, and it has no

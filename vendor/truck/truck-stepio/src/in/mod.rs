@@ -3065,7 +3065,7 @@ impl TryFrom<&ElementarySurfaceAny> for ElementarySurface {
             Plane(x) => Self::Plane(x.as_ref().into()),
             SphericalSurface(x) => Self::Sphere(x.as_ref().into()),
             CylindricalSurface(x) => Self::CylindricalSurface(x.as_ref().into()),
-            ToroidalSurface(x) => Self::ToroidalSurface(x.as_ref().into()),
+            ToroidalSurface(x) => Self::ToroidalSurface(x.as_ref().try_into()?),
             DegenerateToroidalSurface(x) => Self::DegenerateToroidalSurface(x.as_ref().try_into()?),
             ConicalSurface(x) => Self::ConicalSurface(x.as_ref().into()),
         })
@@ -3182,19 +3182,34 @@ pub struct ToroidalSurface {
     minor_radius: f64,
 }
 
-impl From<&ToroidalSurface> for step_geometry::ToroidalSurface {
+impl TryFrom<&ToroidalSurface> for step_geometry::ToroidalSurface {
+    type Error = StepConvertingError;
     #[inline(always)]
-    fn from(
+    fn try_from(
         ToroidalSurface {
             position,
             major_radius,
             minor_radius,
             ..
         }: &ToroidalSurface,
-    ) -> Self {
+    ) -> Result<Self, Self::Error> {
+        // Some exporters use a signed major radius on spindle tori. The
+        // current carrier does not preserve that chart/sheet convention.
+        // Refuse it before calling the kernel's asserting constructor.
+        if !major_radius.is_finite()
+            || !minor_radius.is_finite()
+            || *major_radius <= 0.0
+            || *minor_radius <= 0.0
+        {
+            return Err(format!(
+                "unsupported toroidal_surface radii: major={major_radius}, minor={minor_radius}; \
+                 this carrier requires positive finite radii"
+            )
+            .into());
+        }
         let mat = Matrix4::from(position);
         let torus = Torus::new(Point3::origin(), *major_radius, *minor_radius);
-        Processor::new(torus).transformed(mat)
+        Ok(Processor::new(torus).transformed(mat))
     }
 }
 
@@ -3931,6 +3946,17 @@ impl EdgeCurve {
         Ok(curve)
     }
     pub fn parse_curve3d(&self) -> Result<Curve3D, StepConvertingError> {
+        self.parse_curve3d_impl(false)
+    }
+
+    /// Shell tessellation validates source incidence with its source/mesh
+    /// tolerance and can recover interior B-spline trims. Do not reject those
+    /// edges at the conversion layer's fixed numerical tolerance.
+    pub(crate) fn parse_curve3d_for_tessellation(&self) -> Result<Curve3D, StepConvertingError> {
+        self.parse_curve3d_impl(true)
+    }
+
+    fn parse_curve3d_impl(&self, defer_incidence: bool) -> Result<Curve3D, StepConvertingError> {
         let p = Point3::from(&self.edge_start.vertex_geometry);
         let q = Point3::from(&self.edge_end.vertex_geometry);
         let (p, q) = match self.same_sense {
@@ -3954,6 +3980,9 @@ impl EdgeCurve {
                 // edge that converted correctly today.
                 if let Some(fallback) = Self::reconciling_pcurve_fallback(&ctx, self, p, q)? {
                     return Ok(fallback);
+                }
+                if defer_incidence {
+                    return Ok(curve);
                 }
                 let (front_residual, back_residual) = Self::best_endpoint_residuals(&curve, p, q);
                 Err(format!(
@@ -4039,7 +4068,13 @@ impl EdgeCurve {
     ) -> Result<Curve3D, StepConvertingError> {
         let ctx = ToleranceCtx::unscaled_legacy();
         let mut curve = match curve {
-            CurveAny::Line(_) => Curve3D::Line(Line(p, q)),
+            CurveAny::Line(line) => {
+                // Source vertices may carry a larger uncertainty than the
+                // feature itself. Preserve the declared carrier, just as the
+                // 2D path does, instead of collapsing distinct parallel edges.
+                let line = truck::Line::<Point3>::from(line.as_ref());
+                Curve3D::Line(Line(line.projection(p), line.projection(q)))
+            }
             CurveAny::BoundedCurve(b) => b.as_ref().try_into()?,
             CurveAny::Conic(curve) => match curve.as_ref() {
                 Conic::Circle(circle) => {
@@ -4175,7 +4210,9 @@ impl EdgeCurve {
                 // `master_representation` preference. A pcurve realization is
                 // only ever reached through the gated fallback in
                 // `parse_curve3d`, never branched to here.
-                Self::sub_parse_curve3d(&c.curve_3d, p, q, same_sense)?
+                // The recursive conversion already applies same_sense.
+                // Returning avoids inverting a reversed surface curve twice.
+                return Self::sub_parse_curve3d(&c.curve_3d, p, q, same_sense);
             }
         };
         if !same_sense {
