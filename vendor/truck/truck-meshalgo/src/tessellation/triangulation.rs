@@ -1626,6 +1626,83 @@ enum EstablishedEdge {
 
 /// The one tessellation body every entry point above funnels into.
 #[allow(clippy::too_many_arguments)]
+/// Source trim chords can cross even when their exact planar BREP curves do
+/// not. Locate only proper source/source crossings; synthetic wire joins and
+/// tangent or coincident traversals have no authority to request refinement.
+fn crossed_planar_source_edges<C, S>(
+    shell: &CompressedShell<Point3, C, S>,
+    edges: &[EstablishedEdge],
+    schema_of: &impl Fn(&S) -> formal::SupportSurfaceSchema,
+) -> HashSet<usize> {
+    let mut crossed = HashSet::default();
+    let orient = |a: Point2, b: Point2, c: Point2| {
+        robust::orient2d(
+            robust::Coord { x: a.x, y: a.y },
+            robust::Coord { x: b.x, y: b.y },
+            robust::Coord { x: c.x, y: c.y },
+        )
+    };
+    for face in &shell.faces {
+        let schema = schema_of(&face.surface);
+        let Some(plane) = schema.plane() else {
+            continue;
+        };
+        let gram = plane.gram();
+        let project = |point: Point3| {
+            let delta = point - plane.origin();
+            let du = delta.dot(plane.u_axis());
+            let dv = delta.dot(plane.v_axis());
+            Point2::new(
+                (gram.g11() * du - gram.g01() * dv) / gram.determinant(),
+                (gram.g00() * dv - gram.g01() * du) / gram.determinant(),
+            )
+        };
+        // A source polyline contributes only its own segments, never the
+        // connection to another edge. Sorting by the lower x bound avoids
+        // comparing separated source chords on large planar faces.
+        let mut segments = Vec::new();
+        for edge_use in face.boundaries.iter().flatten() {
+            let Some(EstablishedEdge::Mesh(edge)) = edges.get(edge_use.index) else {
+                continue;
+            };
+            for pair in edge.curve.windows(2) {
+                let (a, b) = (project(pair[0]), project(pair[1]));
+                if [a.x, a.y, b.x, b.y].iter().all(|value| value.is_finite()) {
+                    segments.push((edge_use.index, a, b));
+                }
+            }
+        }
+        segments.sort_unstable_by(|(_, a, b), (_, c, d)| a.x.min(b.x).total_cmp(&c.x.min(d.x)));
+        for (i, &(edge_a, a, b)) in segments.iter().enumerate() {
+            for &(edge_b, c, d) in &segments[i + 1..] {
+                if c.x.min(d.x) > a.x.max(b.x) {
+                    break;
+                }
+                if c.y.min(d.y) > a.y.max(b.y) || c.y.max(d.y) < a.y.min(b.y) {
+                    continue;
+                }
+                let (ab_c, ab_d, cd_a, cd_b) = (
+                    orient(a, b, c),
+                    orient(a, b, d),
+                    orient(c, d, a),
+                    orient(c, d, b),
+                );
+                if ab_c != 0.0
+                    && ab_d != 0.0
+                    && cd_a != 0.0
+                    && cd_b != 0.0
+                    && (ab_c < 0.0) != (ab_d < 0.0)
+                    && (cd_a < 0.0) != (cd_b < 0.0)
+                {
+                    crossed.insert(edge_a);
+                    crossed.insert(edge_b);
+                }
+            }
+        }
+    }
+    crossed
+}
+
 fn cshell_tessellation_inner<'a, C, S>(
     shell: &CompressedShell<Point3, C, S>,
     tol: f64,
@@ -1728,7 +1805,7 @@ where
         .source_geometric_uncertainty
         .filter(|uncertainty| uncertainty.is_finite() && *uncertainty > 0.0)
         .unwrap_or(source_edge::SOURCE_INCIDENCE_TOLERANCE);
-    let tessellate_edge_impl = |edge: &CompressedEdge<C>| {
+    let tessellate_edge_impl = |edge: &CompressedEdge<C>, sample_tol: f64| {
         let curve = &edge.curve;
         let range = curve.range_tuple();
         if edge_probe {
@@ -1808,7 +1885,7 @@ where
         range = match traversal_verdict {
             source_edge::SourceEdgeTraversal::CanonicalByEvalRange { range } => range,
             source_edge::SourceEdgeTraversal::CanonicalBySourceInterval { traversal, .. } => {
-                let poly = source_edge::sample_traversal(curve, &traversal, tol);
+                let poly = source_edge::sample_traversal(curve, &traversal, sample_tol);
                 return EstablishedEdge::Mesh(CompressedEdge {
                     vertices: edge.vertices,
                     curve: poly,
@@ -1846,7 +1923,7 @@ where
                 }
             }
         }
-        let mut poly = PolylineCurve::from_curve(curve, range, tol);
+        let mut poly = PolylineCurve::from_curve(curve, range, sample_tol);
         if poly.len() <= 2 && range.1 - range.0 > 1e-4 {
             let mut pts = Vec::new();
             const STEPS: usize = 16;
@@ -1861,13 +1938,14 @@ where
             curve: poly,
         })
     };
-    let tessellate_edge = |edge: &CompressedEdge<C>| {
-        let mut established =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tessellate_edge_impl(edge)))
-                .unwrap_or(EstablishedEdge::Unresolved {
-                    vertices: edge.vertices,
-                    reason: "edge_tessellation_panicked",
-                });
+    let tessellate_edge = |edge: &CompressedEdge<C>, sample_tol: f64| {
+        let mut established = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            tessellate_edge_impl(edge, sample_tol)
+        }))
+        .unwrap_or(EstablishedEdge::Unresolved {
+            vertices: edge.vertices,
+            reason: "edge_tessellation_panicked",
+        });
         if let EstablishedEdge::Mesh(meshed) = &mut established {
             // Source traversal has already admitted endpoint incidence at this
             // tolerance. Realize those endpoints with their shared BREP vertex
@@ -1897,9 +1975,45 @@ where
         established
     };
     #[cfg(not(target_arch = "wasm32"))]
-    let edges: Vec<EstablishedEdge> = shell.edges.par_iter().map(tessellate_edge).collect();
+    let mut edges: Vec<EstablishedEdge> = shell
+        .edges
+        .par_iter()
+        .map(|edge| tessellate_edge(edge, tol))
+        .collect();
     #[cfg(target_arch = "wasm32")]
-    let edges: Vec<EstablishedEdge> = shell.edges.iter().map(tessellate_edge).collect();
+    let mut edges: Vec<EstablishedEdge> = shell
+        .edges
+        .iter()
+        .map(|edge| tessellate_edge(edge, tol))
+        .collect();
+    // Refine crossing trim chords at their shared source edge, before any
+    // incident face builds constraints. Sampling tolerance is independent of
+    // traversal/incidence tolerance: finer chords cannot change which source
+    // interval or BREP endpoint was admitted. The bounded passes also cover
+    // samplers whose angular policy initially dominates chord tolerance.
+    let mut sample_tolerances = vec![tol; edges.len()];
+    for _ in 0..8 {
+        let crossed = crossed_planar_source_edges(shell, &edges, &schema_of);
+        if crossed.is_empty() {
+            break;
+        }
+        let mut progressed = false;
+        for index in crossed {
+            let next_tol = (sample_tolerances[index] * 0.25).max(TOLERANCE);
+            if next_tol >= sample_tolerances[index] {
+                continue;
+            }
+            sample_tolerances[index] = next_tol;
+            let next = tessellate_edge(&shell.edges[index], next_tol);
+            if matches!(next, EstablishedEdge::Mesh(_)) {
+                edges[index] = next;
+                progressed = true;
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
     // Which surface in this shell does a face's own boundary actually lie on?
     //
     // A residual says the boundary and the surface it was handed are
@@ -17593,6 +17707,66 @@ mod shared_sample_conformity_tests {
     use super::*;
     use std::f64::consts::PI;
     use truck_geometry::prelude::{Cylinder, Line, Plane, RevolutedCurve};
+
+    #[test]
+    fn thin_phase_offset_annulus_shares_refined_trim_samples() {
+        use crate::prelude::{OptimizingFilter, Topology};
+        use truck_modeling::{builder, Face, Solid, Surface, Wire};
+        use truck_topology::shell::ShellCondition;
+        let circle = |radius: f64, phase: f64| -> Wire {
+            let vertex =
+                builder::vertex(Point3::new(radius * phase.cos(), radius * phase.sin(), 0.0));
+            builder::rsweep(
+                &vertex,
+                Point3::origin(),
+                Vector3::unit_z(),
+                Rad(2.0 * PI),
+                2,
+            )
+        };
+        let disk: Face =
+            builder::try_attach_plane(vec![circle(1.0, 0.0), circle(0.9995, PI / 8.0).inverse()])
+                .expect("the concentric annular wires are planar and disjoint"); // H-1: test fixture
+        let solid: Solid = builder::tsweep(&disk, Vector3::unit_z());
+        let shell = solid.boundaries()[0].compress();
+        let meshed = cshell_tessellation_with_outcomes(
+            &shell,
+            0.01,
+            by_search_nearest_parameter,
+            unevidenced_lattice,
+            |surface: &Surface| match surface {
+                Surface::Plane(plane) => formal::identify_plane(plane),
+                _ => formal::SupportSurfaceSchema::not_structurally_identified(
+                    formal::SchemaIdentificationFailure::NoStructuralReader {
+                        representation: "annulus fixture curved side",
+                    },
+                ),
+            },
+            |_| {
+                formal::CurveSchema::not_structurally_identified(
+                    formal::CurveSchemaFailure::NoStructuralReader {
+                        representation: "annulus fixture source curve",
+                    },
+                )
+            },
+        )
+        .shell;
+        assert!(
+            meshed.faces.iter().all(|face| face
+                .surface
+                .as_ref()
+                .is_some_and(|mesh| !mesh.faces().is_empty())),
+            "all annular solid faces survive"
+        );
+        let mut mesh = meshed.to_polygon();
+        mesh.put_together_same_attrs(TOLERANCE)
+            .remove_unused_attrs();
+        assert_eq!(
+            mesh.shell_condition(),
+            ShellCondition::Closed,
+            "crossing coarse trim chords must be refined at their shared BREP edges"
+        );
+    }
 
     #[test]
     fn sphere_pole_longitude_does_not_change_the_shared_arc_chart() {
