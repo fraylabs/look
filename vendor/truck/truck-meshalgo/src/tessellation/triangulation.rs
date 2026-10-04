@@ -17387,7 +17387,7 @@ mod diag002_contract_tests {
             diagnosis::reject(
                 TessellationFailureReason::RejectedDegenerate,
                 diagnosis::FailureStage::ValidityClassification,
-                crate::tessellation::validity::FaceValidityCertificate::all_bounds_collapsed(0),
+                FaceValidityCertificate::all_bounds_collapsed(0),
             )
         });
 

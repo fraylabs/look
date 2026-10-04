@@ -214,7 +214,9 @@ fn voron2_small_cylinder_retains_carriers_and_refuses_off_surface_vertices() {
     // the surface projection's 0.001-unit mesh bound or authorize a new trim.
     for vertex in &shell.vertices {
         let surface = &shell.faces[0].surface;
-        let (u, v) = surface.search_nearest_parameter(*vertex, None, 100).unwrap();
+        let (u, v) = surface
+            .search_nearest_parameter(*vertex, None, 100)
+            .unwrap();
         assert!(surface.subs(u, v).distance(*vertex) > 0.001);
     }
     let mesh = shell.triangulation(0.001);
