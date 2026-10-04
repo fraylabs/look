@@ -4961,6 +4961,27 @@ impl PolyBoundaryPiece {
                         }
                     }
                 };
+                // At a representation-certified sphere pole, longitude is
+                // undefined. Keep the incoming representative before selecting
+                // a deck copy; the projector's arbitrary pole longitude must
+                // not send the departing meridian into a different chart.
+                if let (Some((u0, v0)), Some(collapse)) = (previous, lattice.certified_collapse()) {
+                    if collapse.witness == CollapseWitness::ExactSpherePole {
+                        match collapse.polar {
+                            Axis::U if vp_gen.is_some() => {
+                                if urange.is_some_and(|(lo, hi)| u == lo || u == hi) {
+                                    v = v0;
+                                }
+                            }
+                            Axis::V if up_gen.is_some() => {
+                                if vrange.is_some_and(|(lo, hi)| v == lo || v == hi) {
+                                    u = u0;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 // A nearest point is not an incidence.
                 //
                 // `search_nearest_parameter` answers whether or not the query
@@ -10136,6 +10157,20 @@ fn insert_surface(
         .collect();
     let range = ((bdb.min()[0], bdb.max()[0]), (bdb.min()[1], bdb.max()[1]));
     let (mut udiv, mut vdiv) = surface.parameter_division(range, tol);
+    // This support construction is for rectangular periodic strips. Curved
+    // end trims can project to varying transverse coordinates; using those
+    // as rows wires chords between source-cap samples and can manufacture
+    // planar cap triangles. Keep their existing division policy instead.
+    let rectangular_strip = polyline
+        .0
+        .iter()
+        .flat_map(|loop_| loop_.points.iter())
+        .all(|point| {
+            (point.uv.x - range.0 .0).abs() <= 1.0e-6
+                || (point.uv.x - range.0 .1).abs() <= 1.0e-6
+                || (point.uv.y - range.1 .0).abs() <= 1.0e-6
+                || (point.uv.y - range.1 .1).abs() <= 1.0e-6
+        });
     // A periodic strip needs interior rows in its transverse direction.
     // A flat generatrix supplies only the two trim endpoints; angular grid
     // samples then lie on source trims that cannot be split locally. Broad
@@ -10149,6 +10184,7 @@ fn insert_surface(
         (1, &mut vdiv, surface.u_period().is_some()),
     ] {
         if transverse_periodic
+            && rectangular_strip
             && div.len() == 2
             && polyline
                 .0
@@ -17502,6 +17538,167 @@ mod shared_sample_conformity_tests {
     use truck_geometry::prelude::{Cylinder, Line, Plane, RevolutedCurve};
 
     #[test]
+    fn sphere_pole_longitude_does_not_change_the_shared_arc_chart() {
+        let sphere = truck_geometry::prelude::Sphere::new(Point3::origin(), 0.03016);
+        let incoming = 1.5 * PI;
+        let outgoing = PI;
+        let arcs: Vec<Vec<Point3>> = vec![
+            (0..=16)
+                .map(|i| sphere.subs(0.5 * PI * (1.0 - i as f64 / 16.0), incoming))
+                .collect(),
+            (0..=16)
+                .map(|i| sphere.subs(0.5 * PI * i as f64 / 16.0, outgoing))
+                .collect(),
+            (0..=16)
+                .map(|i| sphere.subs(0.5 * PI, outgoing + 0.5 * PI * i as f64 / 16.0))
+                .collect(),
+        ];
+        let samples: Vec<Point3> = arcs
+            .iter()
+            .flat_map(|arc| arc.iter().take(16).copied())
+            .collect();
+        let wire = arcs
+            .into_iter()
+            .enumerate()
+            .map(|(index, points)| SourcePolyline {
+                curve: PolylineCurve::from(points),
+                source: SourceEdgeUse {
+                    bound: BoundId(0),
+                    index,
+                    orientation: true,
+                },
+            });
+        let project = |surface: &truck_geometry::prelude::Sphere, point: Point3, hint| {
+            if point.distance(Point3::new(0.0, 0.0, 0.03016)) < 1e-12 {
+                // A pole has no longitude. A legal arbitrary representative
+                // must not select a different deck for the departing meridian.
+                Some((0.0, 1.47262155637022))
+            } else {
+                by_search_nearest_parameter(surface, point, hint)
+            }
+        };
+        let piece = PolyBoundaryPiece::try_new(
+            &sphere,
+            wire,
+            project,
+            0.1,
+            &CertifiedLattice::sphere_azimuth(Axis::V),
+        )
+        .expect("a spherical octant lifts"); // H-1: test fixture
+        assert_eq!(
+            piece.0.len(),
+            samples.len() + 1,
+            "all shared arc samples survive"
+        );
+        let lo = piece.0.iter().map(|p| p.uv.y).fold(f64::INFINITY, f64::min);
+        let hi = piece
+            .0
+            .iter()
+            .map(|p| p.uv.y)
+            .fold(f64::NEG_INFINITY, f64::max);
+        assert!(
+            hi - lo <= 0.5 * PI + 1e-6,
+            "a pole representative must not open a 90-degree octant into a 270-degree chart: {}",
+            hi - lo
+        );
+        for (lifted, point) in piece.0.iter().zip(samples.iter().cycle()) {
+            assert_eq!(
+                lifted.point, *point,
+                "the pole fix preserves canonical source samples"
+            );
+        }
+        let lattice = CertifiedLattice::sphere_azimuth(Axis::V);
+        let boundary = PolyBoundary::new(vec![piece], &sphere, 0.1, &lattice);
+        let mesh = trimming_tessellation_result(&sphere, &boundary, 0.1, &lattice)
+            .expect("the corrected spherical octant meshes"); // H-1: test fixture
+        let mut edges = std::collections::HashMap::<(usize, usize), usize>::new();
+        for tri in mesh.tri_faces() {
+            for (a, b) in [
+                (tri[0].pos, tri[1].pos),
+                (tri[1].pos, tri[2].pos),
+                (tri[2].pos, tri[0].pos),
+            ] {
+                *edges.entry((a.min(b), a.max(b))).or_default() += 1;
+            }
+        }
+        let boundary_vertices: std::collections::HashSet<usize> = edges
+            .iter()
+            .filter(|(_, count)| **count == 1)
+            .flat_map(|(&(a, b), _)| [a, b])
+            .collect();
+        for point in samples {
+            assert!(
+                boundary_vertices
+                    .iter()
+                    .any(|&i| mesh.positions()[i].near(&point)),
+                "every shared arc sample must remain on the realized face boundary: {point:?}"
+            );
+        }
+        assert!(
+            edges.values().all(|&count| count <= 2),
+            "the octant has no overlapping triangles"
+        );
+    }
+
+    #[test]
+    fn curved_trim_does_not_become_periodic_strip_support_rows() {
+        let cylinder = Cylinder::new(Point3::origin(), 0.05)
+            .expect("valid cylinder radius")
+            .value; // H-1: test fixture
+        let mut points: Vec<SurfacePoint> = Vec::new();
+        for i in 0..16 {
+            let angle = 0.5 * PI * i as f64 / 16.0;
+            // An admitted projection has a slightly bowed cap latitude; its
+            // shared world samples remain on the planar source cap.
+            let latitude = 0.002 * (2.0 * angle).sin();
+            points.push((Point2::new(angle, latitude), cylinder.subs(angle, 0.0)).into());
+        }
+        for i in 0..16 {
+            let latitude = -i as f64 / 16.0;
+            points.push(
+                (
+                    Point2::new(0.5 * PI, latitude),
+                    cylinder.subs(0.5 * PI, latitude),
+                )
+                    .into(),
+            );
+        }
+        for i in 0..16 {
+            let angle = 0.5 * PI * (1.0 - i as f64 / 16.0);
+            points.push((Point2::new(angle, -1.0), cylinder.subs(angle, -1.0)).into());
+        }
+        for i in 0..16 {
+            let latitude = -1.0 + i as f64 / 16.0;
+            points.push((Point2::new(0.0, latitude), cylinder.subs(0.0, latitude)).into());
+        }
+        let n = points.len();
+        let source = SourceEdgeUse {
+            bound: BoundId(0),
+            index: 0,
+            orientation: true,
+        };
+        let boundary = PolyBoundary(vec![BoundaryLoop::new(
+            points,
+            vec![SegmentOrigin::Source; n],
+            vec![vec![source]; n],
+        )]);
+        let mesh = trimming_tessellation_result(
+            &cylinder,
+            &boundary,
+            0.1,
+            &unevidenced_lattice(&cylinder),
+        )
+        .expect("the curved trim meshes"); // H-1: test fixture
+        for tri in mesh.tri_faces() {
+            let p = tri.map(|vertex| mesh.positions()[vertex.pos]);
+            assert!(
+                !p.iter().all(|point| point.z.abs() < 1e-12),
+                "surface sampling must not turn a curved trim's latitudes into cap material"
+            );
+        }
+    }
+
+    #[test]
     fn adjoining_cylinder_charts_have_no_overlapping_material() {
         let cylinder = Cylinder::new(Point3::origin(), 1.5)
             .expect("valid cylinder radius")
@@ -17558,6 +17755,13 @@ mod shared_sample_conformity_tests {
                 })
                 .collect();
             for tri in mesh.tri_faces() {
+                let [a, b, c] = tri.map(|vertex| mesh.positions()[vertex.pos]);
+                let centre = (a.to_vec() + b.to_vec() + c.to_vec()) / 3.0;
+                let radial = Vector3::new(centre.x, centre.y, 0.0);
+                assert!(
+                    (b - a).cross(c - a).dot(radial) > 1e-12,
+                    "a cylinder triangle must have positive radial coverage, not span its diameter"
+                );
                 let mut key = [ids[tri[0].pos], ids[tri[1].pos], ids[tri[2].pos]];
                 key.sort();
                 for (a, b) in [(key[0], key[1]), (key[1], key[2]), (key[0], key[2])] {
