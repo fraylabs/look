@@ -3194,22 +3194,25 @@ impl TryFrom<&ToroidalSurface> for step_geometry::ToroidalSurface {
             ..
         }: &ToroidalSurface,
     ) -> Result<Self, Self::Error> {
-        // Some exporters use a signed major radius on spindle tori. The
-        // current carrier does not preserve that chart/sheet convention.
-        // Refuse it before calling the kernel's asserting constructor.
+        // SolidWorks/ProE use a negative major radius to reverse bound wires,
+        // not to move the generating circle to a negative radial coordinate.
+        // Match OCCT's StepToGeom::MakeToroidalSurface (absolute radius) and
+        // StepToTopoDS_TranslateFace (reversed wire sense). The carrier keeps
+        // the original UV chart so source pcurves evaluate in that chart;
+        // shell conversion applies the extra bound-wire reversal.
         if !major_radius.is_finite()
             || !minor_radius.is_finite()
-            || *major_radius <= 0.0
+            || *major_radius == 0.0
             || *minor_radius <= 0.0
         {
             return Err(format!(
                 "unsupported toroidal_surface radii: major={major_radius}, minor={minor_radius}; \
-                 this carrier requires positive finite radii"
+                 major must be nonzero and minor positive, both finite"
             )
             .into());
         }
         let mat = Matrix4::from(position);
-        let torus = Torus::new(Point3::origin(), *major_radius, *minor_radius);
+        let torus = Torus::new(Point3::origin(), major_radius.abs(), *minor_radius);
         Ok(Processor::new(torus).transformed(mat))
     }
 }

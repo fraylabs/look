@@ -1,3 +1,5 @@
 `assembly-nullable-synthetic.step` was authored by Fray Labs on 2026-10-04 under MIT OR Apache-2.0, like the surrounding kernel. It describes two placements of a geometry-free child, with nullable metadata across the product and relationship records. Its entity graph and coordinates were written from scratch; no Voron geometry is included. It replaces the GPL-3.0 Voron two-bolt reduction used during diagnosis. The original remains an external Burr corpus input, not a vendored regression fixture.
 
 The manifold-surface assembly test in `../assy.rs` extends that synthetic graph with an empty shell model and a linked surface representation. This extension is also authored by Fray Labs under MIT OR Apache-2.0; it contains no source CAD geometry.
+
+`negative-torus-synthetic.step` was authored by Fray Labs on 2026-10-05 under MIT OR Apache-2.0. Its four circular arcs bound a quarter patch on a torus with radii -1.55 and 5, used by two faces with opposite `same_sense`. The coordinates and topology were written from the analytic equation; it contains no source CAD geometry.
