@@ -1862,11 +1862,39 @@ where
         })
     };
     let tessellate_edge = |edge: &CompressedEdge<C>| {
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tessellate_edge_impl(edge)))
-            .unwrap_or(EstablishedEdge::Unresolved {
-                vertices: edge.vertices,
-                reason: "edge_tessellation_panicked",
-            })
+        let mut established =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tessellate_edge_impl(edge)))
+                .unwrap_or(EstablishedEdge::Unresolved {
+                    vertices: edge.vertices,
+                    reason: "edge_tessellation_panicked",
+                });
+        if let EstablishedEdge::Mesh(meshed) = &mut established {
+            // Source traversal has already admitted endpoint incidence at this
+            // tolerance. Realize those endpoints with their shared BREP vertex
+            // rather than each curve's slightly different evaluated position.
+            // A closed carrier's arbitrary parameter seam need not coincide
+            // with the source vertex; leave that seam alone when it does not.
+            let incidence_tol = source_tolerance
+                .max(source_edge::SOURCE_INCIDENCE_TOLERANCE)
+                .max(tol);
+            if let (Some(point), Some(vertex)) = (
+                meshed.curve.first_mut(),
+                vertices.as_slice().get(edge.vertices.0),
+            ) {
+                if point.distance(*vertex) <= incidence_tol {
+                    *point = *vertex;
+                }
+            }
+            if let (Some(point), Some(vertex)) = (
+                meshed.curve.last_mut(),
+                vertices.as_slice().get(edge.vertices.1),
+            ) {
+                if point.distance(*vertex) <= incidence_tol {
+                    *point = *vertex;
+                }
+            }
+        }
+        established
     };
     #[cfg(not(target_arch = "wasm32"))]
     let edges: Vec<EstablishedEdge> = shell.edges.par_iter().map(tessellate_edge).collect();
@@ -5234,8 +5262,14 @@ impl PolyBoundaryPiece {
                         }
                     }
                 }
-                vec.push((Point2::new(u, v), pt).into());
-                lifted_tags.push(tag);
+                // Bisection points disambiguate the lift; they are not samples
+                // of the shared BREP edge. Emitting them would independently
+                // split this face's boundary and leave a T-junction on its
+                // neighbour (and a chord midpoint need not lie on the curve).
+                if !synthetic {
+                    vec.push((Point2::new(u, v), pt).into());
+                    lifted_tags.push(tag);
+                }
                 previous = Some((u, v));
                 previous_pt = Some(pt);
             }
@@ -11304,6 +11338,18 @@ impl CollapsedPeriodicBoundaryPair {
             .map(|p| if is_v { p.uv.x } else { p.uv.y })
             .sum::<f64>()
             / loop0.len() as f64;
+
+        // An apex cap is bounded by one latitude orbit. A cone annulus with
+        // an explicit source seam also spans a period, but its two latitudes
+        // already bound a complete chart cell. Closing that cell to an apex
+        // invents material and emits overlapping triangles at the seam.
+        let ctx = ToleranceCtx::unscaled_legacy();
+        if loop0.iter().any(|p| {
+            let radial = if is_v { p.uv.x } else { p.uv.y };
+            !ctx.is_small_ratio(radial - base_r)
+        }) {
+            return None;
+        }
 
         // 3. Analytically compute exact apex parameter where angular orbit collapses in 3D.
         use cgmath::InnerSpace;
@@ -17404,5 +17450,102 @@ mod diag002_contract_tests {
         );
         std::env::remove_var("TRUCK_FACE_DIAG");
         let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[cfg(test)]
+mod shared_sample_conformity_tests {
+    use super::*;
+    use std::f64::consts::PI;
+    use truck_geometry::prelude::{Line, Plane, RevolutedCurve};
+
+    #[test]
+    fn seam_bounded_cone_band_does_not_invent_an_apex() {
+        let cone = RevolutedCurve::by_revolution(
+            Line(Point3::new(1.0, 0.0, 0.0), Point3::new(2.0, 0.0, 1.0)),
+            Point3::origin(),
+            Vector3::unit_z(),
+        );
+        let points: Vec<SurfacePoint> = [
+            (0.0, 0.0),
+            (1.0, 0.0),
+            (1.0, PI),
+            (1.0, 2.0 * PI),
+            (0.0, 2.0 * PI),
+            (0.0, PI),
+        ]
+        .into_iter()
+        .map(|(u, v)| (Point2::new(u, v), cone.subs(u, v)).into())
+        .collect();
+        assert!(
+            CollapsedPeriodicBoundaryPair::try_classify(
+                &cone,
+                &[points],
+                &[],
+                cone.try_range_tuple(),
+                &unevidenced_lattice(&cone),
+            )
+            .is_none(),
+            "a seam-bounded annulus has no collapsed apex boundary"
+        );
+    }
+
+    #[test]
+    fn shared_curved_edge_preserves_source_samples() {
+        let cylinder = RevolutedCurve::by_revolution(
+            Line(Point3::new(1.0, 0.0, 0.0), Point3::new(1.0, 0.0, 1.0)),
+            Point3::origin(),
+            Vector3::unit_z(),
+        );
+        let plane = Plane::new(
+            Point3::origin(),
+            Point3::new(1.0, 0.0, 0.0),
+            Point3::new(0.0, 1.0, 0.0),
+        );
+        let mut samples: Vec<Point3> = [0.0, 0.92 * PI, 1.84 * PI, 2.0 * PI]
+            .into_iter()
+            .map(|v| cylinder.subs(0.0, v))
+            .collect();
+        samples[3] = samples[0];
+        let source = SourceEdgeUse {
+            bound: BoundId(0),
+            index: 0,
+            orientation: true,
+        };
+        let wire = || {
+            std::iter::once(SourcePolyline {
+                curve: PolylineCurve::from(samples.clone()),
+                source,
+            })
+        };
+        let cyl_piece = PolyBoundaryPiece::try_new(
+            &cylinder,
+            wire(),
+            by_search_nearest_parameter,
+            0.5,
+            &unevidenced_lattice(&cylinder),
+        )
+        .expect("the curved edge lifts on its cylinder"); // H-1: test fixture
+        let plane_piece = PolyBoundaryPiece::try_new(
+            &plane,
+            wire(),
+            by_search_nearest_parameter,
+            0.5,
+            &unevidenced_lattice(&plane),
+        )
+        .expect("the same curved edge lifts on its cap"); // H-1: test fixture
+        for piece in [&cyl_piece, &plane_piece] {
+            assert_eq!(
+                piece.0.len(),
+                samples.len(),
+                "lifting must not add a face-local boundary sample"
+            );
+            for (lifted, sample) in piece.0.iter().zip(&samples) {
+                assert_eq!(
+                    lifted.point, *sample,
+                    "source samples survive lifting verbatim"
+                );
+            }
+        }
     }
 }
