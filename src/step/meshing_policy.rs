@@ -18,9 +18,12 @@
 //!
 //! The policy is applied per feature, not globally: see
 //! [`crate::step::policy_geometry`], which wraps each STEP edge curve and
-//! surface so that only circular curves and cylindrical/conical circumferential
-//! directions see the angular floor. Straight edges, axial directions, and
-//! non-elementary surfaces keep their existing treatment.
+//! surface so that eligible circular curves and cylindrical/conical
+//! circumferential directions see the angular floor. Newly admitted, entirely
+//! analytic shells containing a source-signed torus also refine both native
+//! torus angles and their shared circle boundaries. Other torus neighborhoods,
+//! straight edges, axial directions, and non-elementary surfaces keep their
+//! existing treatment.
 
 use serde::{Deserialize, Serialize};
 
