@@ -794,7 +794,7 @@ impl Table {
         let attrs = PartAttrs {
             id: product.id.clone(),
             name: product.name.clone(),
-            description: product.description.clone(),
+            description: product.description.clone().unwrap_or_default(),
         };
 
         let Some(sdr) = self.shape_definition_representation.values().find(|sdr| {
@@ -898,7 +898,7 @@ impl Table {
         let attrs = PartAttrs {
             id: next_assy.id.clone(),
             name: next_assy.name.clone(),
-            description: next_assy.description.clone(),
+            description: next_assy.description.clone().unwrap_or_default(),
         };
 
         let Some(cdsr) = self
@@ -912,7 +912,9 @@ impl Table {
                 pds_idx == idx
             })
         else {
-            return Err("".into());
+            return Err(
+                "missing CONTEXT_DEPENDENT_SHAPE_REPRESENTATION for assembly occurrence".into(),
+            );
         };
 
         let PlaceHolder::Ref(Name::Entity(srrwt_idx)) = &cdsr.representation_relation else {
@@ -925,7 +927,35 @@ impl Table {
         else {
             return Err("failed to reference `shape_representation_relationship`".into());
         };
-        let idtf = srrwt.transformation_operator.clone().into_owned(self)?;
+        let mut idtf = srrwt.transformation_operator.clone().into_owned(self)?;
+        // The relationship maps rep_1 to rep_2. Assembly edges always map
+        // child coordinates to parent coordinates; exporters may name either
+        // representation first (SolidWorks names the parent first).
+        let parent_rep = self
+            .shape_definition_representation
+            .values()
+            .find_map(|sdr| {
+                let PlaceHolder::Ref(Name::Entity(pds_id)) = &sdr.definition else {
+                    return None;
+                };
+                let pds = self.product_definition_shape.get(pds_id)?;
+                if pds.definition != PlaceHolder::Ref(Name::Entity(parent_idx)) {
+                    return None;
+                }
+                Some(&sdr.used_representation)
+            });
+        match parent_rep {
+            Some(rep) if rep == &srrwt.rep_1 => {
+                std::mem::swap(&mut idtf.transform_item_1, &mut idtf.transform_item_2);
+            }
+            Some(rep) if rep == &srrwt.rep_2 => {}
+            _ => {
+                return Err(
+                    "assembly placement relationship does not identify the parent representation"
+                        .into(),
+                )
+            }
+        }
 
         let entity = AssembleEntity {
             matrix: NodeMatrix::Transform(idtf.into()),
@@ -956,6 +986,10 @@ impl Table {
             } else if let Some(next_assy) = self.next_assembly_usage_occurrence.get(&idx) {
                 assy_nodes.push(self.assy_node_entity(pds_idx, next_assy)?);
             }
+        }
+
+        if assy_nodes.len() != self.next_assembly_usage_occurrence.len() {
+            return Err("not every NEXT_ASSEMBLY_USAGE_OCCURRENCE has a resolved product shape relationship".into());
         }
 
         let adjacency = assy_nodes
@@ -1637,6 +1671,26 @@ DATA;
 ENDSEC;
 END-ISO-10303-21;
 "#;
+
+    #[test]
+    fn reversed_representation_relationship_keeps_child_world_placement() {
+        let forward = Table::from_step(FIXTURE).unwrap();
+        let reversed_text = FIXTURE.replace("#160,#163)", "#163,#160)").replace(
+            "#630 = ITEM_DEFINED_TRANSFORMATION('','',#141,#144);",
+            "#630 = ITEM_DEFINED_TRANSFORMATION('','',#144,#141);",
+        );
+        let reversed = Table::from_step(&reversed_text).unwrap();
+        let forward_assy = forward.step_assy().unwrap();
+        let reversed_assy = reversed.step_assy().unwrap();
+        let matrix_for = |assy: &StepAssembly| {
+            let edge = assy
+                .all_edges()
+                .find(|edge| edge.attrs().id == "occA")
+                .unwrap();
+            Matrix4::try_from(edge.matrix()).unwrap()
+        };
+        assert_eq!(matrix_for(&forward_assy), matrix_for(&reversed_assy));
+    }
 
     fn mapped_assembly() -> (
         StepAssembly,

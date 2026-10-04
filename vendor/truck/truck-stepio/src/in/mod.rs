@@ -4512,7 +4512,7 @@ pub struct ProductContext {
 pub struct Product {
     pub id: String,
     pub name: String,
-    pub description: String,
+    pub description: Option<String>,
     #[holder(use_place_holder)]
     pub frame_of_reference: Vec<ProductContext>,
 }
@@ -4523,7 +4523,7 @@ pub struct Product {
 #[holder(generate_deserialize)]
 pub struct ProductDefinitionFormation {
     pub id: String,
-    pub description: String,
+    pub description: Option<String>,
     #[holder(use_place_holder)]
     pub of_product: Product,
 }
@@ -4545,7 +4545,7 @@ pub struct ProductDefinitionContext {
 #[holder(generate_deserialize)]
 pub struct ProductDefinition {
     pub id: String,
-    pub description: String,
+    pub description: Option<String>,
     #[holder(use_place_holder)]
     pub formation: ProductDefinitionFormation,
     #[holder(use_place_holder)]
@@ -4567,8 +4567,8 @@ pub enum CharacterizedDefinition {
 #[holder(field = product_definition_shape)]
 #[holder(generate_deserialize)]
 pub struct ProductDefinitionShape {
-    pub name: String,
-    pub description: String,
+    pub name: Option<String>,
+    pub description: Option<String>,
     #[holder(use_place_holder)]
     pub definition: CharacterizedDefinition,
 }
@@ -4612,8 +4612,8 @@ pub struct ShapeDefinitionRepresentation {
 #[holder(field = shape_representation_relationship)]
 #[holder(generate_deserialize)]
 pub struct ShapeRepresentationRelationship {
-    pub name: String,
-    pub description: String,
+    pub name: Option<String>,
+    pub description: Option<String>,
     #[holder(use_place_holder)]
     pub rep_1: ShapeRepresentation,
     #[holder(use_place_holder)]
@@ -4625,8 +4625,8 @@ pub struct ShapeRepresentationRelationship {
 #[holder(field = shape_representation_relationship_with_transformation)]
 #[holder(generate_deserialize)]
 pub struct ShapeRepresentationRelationshipWithTransformation {
-    pub name: String,
-    pub description: String,
+    pub name: Option<String>,
+    pub description: Option<String>,
     #[holder(use_place_holder)]
     pub rep_1: ShapeRepresentation,
     #[holder(use_place_holder)]
@@ -4642,7 +4642,7 @@ pub struct ShapeRepresentationRelationshipWithTransformation {
 pub struct NextAssemblyUsageOccurrence {
     pub id: String,
     pub name: String,
-    pub description: String,
+    pub description: Option<String>,
     #[holder(use_place_holder)]
     pub relating_product_definition: ProductDefinition,
     #[holder(use_place_holder)]
@@ -4655,8 +4655,8 @@ pub struct NextAssemblyUsageOccurrence {
 #[holder(field = item_defined_transformation)]
 #[holder(generate_deserialize)]
 pub struct ItemDefinedTransformation {
-    name: String,
-    description: String,
+    name: Option<String>,
+    description: Option<String>,
     #[holder(use_place_holder)]
     transform_item_1: Axis2Placement,
     #[holder(use_place_holder)]

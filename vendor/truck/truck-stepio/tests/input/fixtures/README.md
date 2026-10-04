@@ -1,0 +1,1 @@
+assembly-pds-dollar.step is the original two-bolt regression reduced from Voron-0 Fly Gemini V2 Din Mount 2pc.step. Source: https://github.com/VoronDesign/Voron-0 (GPL-3.0). Entity IDs and geometry are unchanged; original occurrence IDs 48 and 49. This fixture retains its source licence. See Burr artifacts/corpus/repros/01-assembly.metadata.json for reduction provenance.
