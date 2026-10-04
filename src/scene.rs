@@ -110,6 +110,8 @@ pub struct Instance {
 #[derive(Debug, Clone)]
 pub struct CompiledScene {
     pub source_hash: String,
+    /// Unresolved assembly occurrences or missing component geometry.
+    pub assembly_structure_errors: Vec<String>,
     pub geometries: Vec<Geometry>,
     pub instances: Vec<Instance>,
     pub materials: Vec<SourceMaterial>,
@@ -386,6 +388,20 @@ fn compile_step(
             include_source_materials,
             timings,
         ),
+        crate::step::StepScene::IncompleteFlat((positions, indices, colors), reason) => {
+            let mut scene = compile_step_flat(
+                path,
+                positions,
+                indices,
+                colors,
+                source_hash,
+                up_axis,
+                include_source_materials,
+                timings,
+            )?;
+            scene.assembly_structure_errors.push(reason);
+            Ok(scene)
+        }
         crate::step::StepScene::Assembly(assembly) => compile_step_assembly(
             path,
             assembly,
@@ -466,8 +482,14 @@ fn compile_step_assembly(
             .zip(normals)
             .map(|(position, normal)| Vertex { position, normal })
             .collect::<Vec<_>>();
-        let local_bounds =
-            Bounds::from_position_iter(vertices.iter().map(|vertex| vertex.position));
+        let local_bounds = if vertices.is_empty() {
+            Bounds {
+                min: [0.0; 3],
+                max: [0.0; 3],
+            }
+        } else {
+            Bounds::from_position_iter(vertices.iter().map(|vertex| vertex.position))
+        };
         let source_attributes = include_source_materials.then(|| {
             colors
                 .iter()
@@ -499,7 +521,10 @@ fn compile_step_assembly(
         } else {
             Mat3::IDENTITY
         };
-        bounds.include_transformed(&geometries[occurrence.definition].bounds, transform);
+        let geometry = &geometries[occurrence.definition];
+        if !geometry.indices.is_empty() {
+            bounds.include_transformed(&geometry.bounds, transform);
+        }
         instances.push(Instance {
             geometry: occurrence.definition,
             material: 0,
@@ -522,6 +547,7 @@ fn compile_step_assembly(
     timings.record("compile", compile_started.elapsed());
 
     Ok(CompiledScene {
+        assembly_structure_errors: scene.structure_errors,
         source_hash,
         geometries,
         instances,
@@ -616,6 +642,7 @@ fn compile_triangle_mesh(
     timings.record("compile", compile_started.elapsed());
 
     Ok(CompiledScene {
+        assembly_structure_errors: Vec::new(),
         source_hash,
         geometries: vec![geometry],
         instances: vec![instance],
@@ -972,6 +999,7 @@ fn compile_glb_internal(
     };
 
     Ok(CompiledScene {
+        assembly_structure_errors: Vec::new(),
         source_hash,
         geometries,
         instances,
@@ -997,6 +1025,7 @@ fn scene_fit_radius(geometries: &[Geometry], instances: &[Instance], bounds: &Bo
     let scene_center = bounds.center();
     instances
         .iter()
+        .filter(|instance| !geometries[instance.geometry].indices.is_empty())
         .map(|instance| {
             let geometry = &geometries[instance.geometry];
             let center = instance

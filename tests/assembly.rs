@@ -165,7 +165,7 @@ fn assembly() -> look::step::StepAssemblyScene {
     let mut timings = Timings::default();
     match parse_step_scene(FIXTURE.as_bytes(), &mut timings).expect("fixture must parse") {
         StepScene::Assembly(scene) => scene,
-        StepScene::Flat(_) => {
+        StepScene::Flat(_) | StepScene::IncompleteFlat(_, _) => {
             panic!("the fixture declares occurrences and must take the assembly path")
         }
     }
@@ -176,21 +176,21 @@ fn translation(world: &glam::Mat4) -> [f32; 3] {
 }
 
 /// The assembly scene keeps definition geometry and occurrences separate:
-/// three geometry-bearing definitions, five renderable occurrences (the two
-/// geometry-less nodes' occurrences carry no instance), six product nodes.
+/// three geometry-bearing definitions and an empty leaf definition, six
+/// source occurrences (one with a loss reason), and six product nodes.
 #[test]
 fn assembly_scene_counts_are_graph_semantic() {
     let scene = assembly();
     assert_eq!(scene.nodes, 6, "root, sub, A, B, C, D");
     assert_eq!(
         scene.definitions.len(),
-        3,
-        "A, B and D carry definition geometry"
+        4,
+        "A, B and D carry geometry; C retains an empty definition"
     );
     assert_eq!(
         scene.occurrences.len(),
-        5,
-        "A, B x2, D x2; C and sub render nothing"
+        6,
+        "A, B x2, C, D x2; the subassembly has no body of its own"
     );
 }
 
@@ -301,5 +301,121 @@ fn single_part_step_stays_flat() {
     assert!(
         matches!(scene, StepScene::Flat(_)),
         "a file with no occurrences must use the single-part path"
+    );
+}
+
+#[test]
+fn flat_multi_solid_export_keeps_each_solid_as_a_component() {
+    // Geometry only: two MANIFOLD_SOLID_BREP entities, no product occurrences.
+    let mut text =
+        String::from("ISO-10303-21;HEADER;FILE_SCHEMA(('AUTOMOTIVE_DESIGN'));ENDSEC;DATA;\n");
+    for line in FIXTURE.lines() {
+        if let Some(id) = line
+            .strip_prefix('#')
+            .and_then(|s| s.split_whitespace().next())
+            .and_then(|s| s.parse::<u64>().ok())
+        {
+            if id == 5 || (100..=131).contains(&id) {
+                text.push_str(line);
+                text.push('\n');
+            }
+        }
+    }
+    text.push_str("ENDSEC;END-ISO-10303-21;");
+    let scene = parse_step_scene(text.as_bytes(), &mut Timings::default()).unwrap();
+    assert!(matches!(scene, StepScene::Assembly(ref assembly) if assembly.occurrences.len() == 2));
+}
+
+#[test]
+fn unresolved_occurrence_reports_structure_loss() {
+    let broken = FIXTURE.replace(
+        "#600 = NEXT_ASSEMBLY_USAGE_OCCURRENCE('occA','','',#12,#22,'');",
+        "#600 = NEXT_ASSEMBLY_USAGE_OCCURRENCE('occA','','',#12,#99999,'');",
+    );
+    let scene = parse_step_scene(broken.as_bytes(), &mut Timings::default()).unwrap();
+    assert!(matches!(scene, StepScene::IncompleteFlat(_, _)));
+}
+
+#[test]
+fn a_dropped_occurrence_record_still_reports_structure_loss() {
+    let broken = FIXTURE.replace(
+        "#600 = NEXT_ASSEMBLY_USAGE_OCCURRENCE('occA','','',#12,#22,'');",
+        "#600 = NEXT_ASSEMBLY_USAGE_OCCURRENCE('occA','','',#12,#22);",
+    );
+    let scene = parse_step_scene(broken.as_bytes(), &mut Timings::default()).unwrap();
+    assert!(matches!(scene, StepScene::IncompleteFlat(_, ref reason) if reason.contains("only")));
+}
+
+#[test]
+fn an_occurrence_without_a_product_shape_relationship_is_not_silently_dropped() {
+    let broken = FIXTURE
+        .lines()
+        .filter(|line| !line.starts_with("#610 ="))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let scene = parse_step_scene(broken.as_bytes(), &mut Timings::default()).unwrap();
+    assert!(matches!(scene, StepScene::IncompleteFlat(_, _)));
+}
+
+#[test]
+fn root_product_geometry_is_an_occurrence_alongside_its_children() {
+    let base = assembly();
+    let text = FIXTURE.replace(
+        "SHAPE_REPRESENTATION('main',(",
+        "SHAPE_REPRESENTATION('main',(#130,",
+    );
+    let scene = parse_step_scene(text.as_bytes(), &mut Timings::default()).unwrap();
+    let StepScene::Assembly(scene) = scene else {
+        panic!("source graph must be retained")
+    };
+    assert_eq!(scene.occurrences.len(), base.occurrences.len() + 1);
+    let root = scene
+        .occurrences
+        .iter()
+        .find(|occurrence| occurrence.node_name == "assembly")
+        .unwrap();
+    assert_eq!(root.world, glam::Mat4::IDENTITY);
+}
+
+#[test]
+fn a_geometry_less_leaf_retains_its_occurrence_and_reports_loss() {
+    let scene = assembly();
+    let leaf = scene
+        .occurrences
+        .iter()
+        .find(|occurrence| occurrence.node_name == "partC")
+        .expect("source leaf occurrence must survive");
+    let definition = &scene.definitions[leaf.definition];
+    assert!(definition.soup.0.is_empty());
+    assert!(definition.soup.1.is_empty());
+    assert!(
+        scene
+            .structure_errors
+            .iter()
+            .any(|reason| reason.contains("partC"))
+    );
+}
+
+#[test]
+fn empty_leaf_does_not_poison_compiled_scene_bounds() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("empty-leaf.step");
+    std::fs::write(&path, FIXTURE).unwrap();
+    let scene = look::scene::compile_scene(&path, look::config::UpAxis::Z, &mut Timings::default())
+        .unwrap();
+    assert_eq!(scene.instances.len(), 6);
+    let leaf = scene
+        .instances
+        .iter()
+        .find(|instance| instance.node_name.as_deref() == Some("partC"))
+        .unwrap();
+    assert!(scene.geometries[leaf.geometry].indices.is_empty());
+    assert!(scene.fit_radius.is_finite());
+    assert!(!scene.bounds.is_empty());
+    assert!(
+        scene
+            .assembly_structure_errors
+            .iter()
+            .any(|reason| reason.contains("partC"))
     );
 }

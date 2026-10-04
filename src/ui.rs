@@ -684,6 +684,7 @@ mod tests {
         // viewer must fall back to the instance material's baseColorFactor.
         let material_color = [0.9f32, 0.2, 0.1, 1.0];
         let scene = CompiledScene {
+            assembly_structure_errors: Vec::new(),
             source_hash: "test".to_string(),
             geometries: vec![geom],
             instances: vec![inst],
