@@ -32,14 +32,15 @@
 //! "circular" alone is not sufficient eligibility.
 //!
 //! A circular edge is densified only when **every** incident face belongs to
-//! the stable target set {plane, cylinder, cone}. A typical mechanical hole —
+//! the stable target set {plane, cylinder, cone, torus}. A typical mechanical hole —
 //! planar face ↔ circular edge ↔ cylindrical wall — stays eligible; a blended
 //! cylinder ↔ sphere or cylinder ↔ spline transition keeps baseline sampling
 //! on the shared edge. Cylindrical/conical interior floors are gated the same
-//! way: a revolved face's circumferential floor applies only when its circular
+//! way: a revolved face's angular floor applies only when its circular
 //! boundaries are all eligible, avoiding a dense-interior/coarse-boundary
 //! mismatch on mixed neighborhoods. Because the whole connected neighborhood
-//! uses one policy per edge, adjacency stays crack-free.
+//! uses one policy per edge, adjacency stays crack-free. Tori floor both native
+//! angular axes so refined circular boundaries retain a compatible interior.
 
 use truck_meshalgo::prelude::{
     BoundedCurve, BoundedSurface, D2, ParameterDivision1D, ParameterDivision2D, ParameterRange,
@@ -62,16 +63,18 @@ fn is_target_surface(surface: &Surface) -> bool {
         Surface::ElementarySurface(ElementarySurface::Plane(_))
             | Surface::ElementarySurface(ElementarySurface::CylindricalSurface(_))
             | Surface::ElementarySurface(ElementarySurface::ConicalSurface(_))
+            | Surface::ElementarySurface(ElementarySurface::ToroidalSurface(_))
     )
 }
 
-/// Whether a surface is a cylinder or cone (the revolved elementary surfaces
-/// whose circumferential direction the policy can floor).
+/// Elementary carriers whose angular directions the policy can floor. A torus
+/// needs both its revolution and meridian grids to follow refined boundaries.
 fn is_revolved_target(surface: &Surface) -> bool {
     matches!(
         surface,
         Surface::ElementarySurface(ElementarySurface::CylindricalSurface(_))
             | Surface::ElementarySurface(ElementarySurface::ConicalSurface(_))
+            | Surface::ElementarySurface(ElementarySurface::ToroidalSurface(_))
     )
 }
 
@@ -99,7 +102,7 @@ fn circular_radius(curve: &Curve3D) -> Option<f64> {
 /// [`ParameterDivision1D`] to apply the angular floor — but only when
 /// [`eligible`](Self::new) is set, i.e. the edge is a certified circle whose
 /// every incident face is in the target set. Ineligible edges (non-circles,
-/// or circles shared with a sphere/spline/torus/etc.) divide at the baseline
+/// or circles shared with a sphere/spline/etc.) divide at the baseline
 /// linear tolerance, exactly as before.
 #[derive(Clone, Debug)]
 pub struct PolicyCurve {
@@ -193,7 +196,7 @@ impl ParameterDivision1D for PolicyCurve {
 /// unchanged and overrides [`ParameterDivision2D`] to hold the circumferential
 /// direction of cylindrical and conical surfaces to the policy's angular floor
 /// — but only when [`interior_eligible`](Self::new) is set, i.e. the face is a
-/// cylinder/cone whose circular boundaries are all eligible. Otherwise the
+/// cylinder/cone/torus whose circular boundaries are all eligible. Otherwise the
 /// surface divides at the baseline tolerance, preserving the
 /// dense-interior/coarse-boundary match.
 /// A per-axis quotient map from cover (deck-lifted) coordinates to the native
@@ -234,7 +237,7 @@ impl QuotientAxis {
 /// unchanged and overrides [`ParameterDivision2D`] to hold the circumferential
 /// direction of cylindrical and conical surfaces to the policy's angular floor
 /// — but only when [`interior_eligible`](Self::new) is set, i.e. the face is a
-/// cylinder/cone whose circular boundaries are all eligible. Otherwise the
+/// cylinder/cone/torus whose circular boundaries are all eligible. Otherwise the
 /// surface divides at the baseline tolerance, preserving the
 /// dense-interior/coarse-boundary match.
 ///
@@ -498,7 +501,22 @@ impl ParameterDivision2D for PolicySurface {
         // the angular floor then lifts the circumferential count if the linear
         // term left it below the policy's proportional share of a revolution.
         let capped_tol = tol.min(self.policy.maximum_absolute_deflection);
-        let (udiv, vdiv) = self.inner.parameter_division(range, capped_tol);
+        let (mut udiv, mut vdiv) = self.inner.parameter_division(range, capped_tol);
+        if matches!(
+            self.inner,
+            Surface::ElementarySurface(ElementarySurface::ToroidalSurface(_))
+        ) {
+            // Native STEP torus U is revolution and V is meridian. Refining
+            // only the boundary leaves the interior too coarse to represent
+            // the same periodic chart consistently at a fillet.
+            for (division, (min, max)) in [(&mut udiv, range.0), (&mut vdiv, range.1)] {
+                let needed = self.policy.surface_floor_segments(max - min);
+                if needed >= 2 && division.len() < needed {
+                    *division = uniform_linspace(min, max, needed);
+                }
+            }
+            return (udiv, vdiv);
+        }
         let (v_min, v_max) = range.1;
         let needed = self.policy.surface_floor_segments(v_max - v_min);
         if needed >= 2 && vdiv.len() < needed {
@@ -637,8 +655,8 @@ fn uniform_linspace(a: f64, b: f64, n: usize) -> Vec<f64> {
 ///
 /// [`edge_eligible`](Self::edge_eligible) is true for a canonical topological
 /// edge exactly when it is a certified circle and every face incident on it is
-/// in the target set {plane, cylinder, cone}. [`face_interior_eligible`]
-/// `(Self::face_interior_eligible)` is true for a cylinder/cone face exactly
+/// in the target set {plane, cylinder, cone, torus}. [`face_interior_eligible`]
+/// `(Self::face_interior_eligible)` is true for a cylinder/cone/torus face exactly
 /// when every circular edge in its boundary is edge-eligible, so the
 /// circumferential interior floor never creates a dense-interior/coarse-boundary
 /// mismatch on a mixed neighborhood.
@@ -791,6 +809,53 @@ mod quotient_tests {
     use super::*;
     use truck_geometry::prelude::{BSplineSurface, KnotVec, Point3};
     use truck_meshalgo::prelude::{InnerSpace, ParametricSurface};
+
+    #[test]
+    fn torus_shared_circles_receive_the_floor_but_sphere_joins_do_not() {
+        use truck_geometry::prelude::{Matrix4, Sphere, Torus};
+        use truck_stepio::r#in::step_geometry::{
+            Processor, Sphere as StepSphere, TrimmedCurve, UnitCircle,
+        };
+        let circle = Curve3D::Conic(Conic3D::Circle(Processor::with_transform(
+            TrimmedCurve::new(UnitCircle::new(), (0.0, std::f64::consts::TAU)),
+            Matrix4::from_scale(4.25),
+        )));
+        let torus = Surface::ElementarySurface(ElementarySurface::ToroidalSurface(Processor::new(
+            Torus::new(Point3::new(0.0, 0.0, 0.0), 3.75, 0.5),
+        )));
+        let mut shell = CompressedShell {
+            vertices: vec![Point3::new(4.25, 0.0, 0.0)],
+            edges: vec![CompressedEdge {
+                vertices: (0, 0),
+                curve: circle,
+            }],
+            faces: vec![CompressedFace {
+                boundaries: vec![vec![(0, true).into()]],
+                orientation: true,
+                surface: torus,
+                provenance: Default::default(),
+            }],
+            source_geometric_uncertainty: None,
+        };
+        let eligibility = Eligibility::compute(&shell);
+        assert!(eligibility.edge_eligible[0]);
+        assert!(eligibility.face_interior_eligible[0]);
+        let surface =
+            PolicySurface::new(shell.faces[0].surface.clone(), MeshingPolicy::DEFAULT, true);
+        let (u, v) = surface.parameter_division(
+            ((0.0, std::f64::consts::TAU), (0.0, std::f64::consts::TAU)),
+            1.0,
+        );
+        assert!(u.len() >= MeshingPolicy::DEFAULT.angular_floor_segments());
+        assert!(v.len() >= MeshingPolicy::DEFAULT.angular_floor_segments());
+        let wrapped = PolicyCurve::new(shell.edges[0].curve.clone(), MeshingPolicy::DEFAULT, true);
+        let (parameters, _) = wrapped.parameter_division((0.0, std::f64::consts::TAU), 1.0);
+        assert!(parameters.len() - 1 >= MeshingPolicy::DEFAULT.angular_floor_segments());
+        shell.faces[0].surface = Surface::ElementarySurface(ElementarySurface::Sphere(
+            Processor::new(StepSphere(Sphere::new(Point3::new(0.0, 0.0, 0.0), 4.25))),
+        ));
+        assert!(!Eligibility::compute(&shell).edge_eligible[0]);
+    }
 
     /// A degree-2 clamped spline over `[0,1]^2` whose `v` direction is a
     /// genuinely closed strip (last control row == first, penultimate row the

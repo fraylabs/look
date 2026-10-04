@@ -62,3 +62,21 @@ fn filleted_box_is_closed_and_manifold() {
 fn phase_offset_thin_annulus_is_closed_and_manifold() {
     assert_closed_fixture("thin-annulus");
 }
+
+#[test]
+fn circular_edges_shared_with_tori_keep_the_angular_floor() {
+    assert_closed_fixture("torus-fillet");
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/mesh-conformity/torus-fillet.step");
+    let scene = compile_scene(&path, UpAxis::Z, &mut Timings::default()).unwrap();
+    let points = &scene.geometries[0].vertices;
+    // The analytically authored carrier has radius 4.25. The source is rotated
+    // by half the angular floor's interval; all circular joins meet tori.
+    for axis in [0, 2] {
+        let extent = points
+            .iter()
+            .map(|v| v.position[axis].abs())
+            .fold(0.0_f32, f32::max);
+        assert!(4.25 - extent < 0.05, "axis {axis}: extent {extent}");
+    }
+}

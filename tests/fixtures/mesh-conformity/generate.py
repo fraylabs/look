@@ -9,6 +9,8 @@ from OCP.TopoDS import TopoDS
 from OCP.STEPControl import STEPControl_Writer,STEPControl_AsIs
 from OCP.BRepCheck import BRepCheck_Analyzer
 from OCP.IFSelect import IFSelect_RetDone
+from OCP.BRepAdaptor import BRepAdaptor_Curve
+from OCP.GeomAbs import GeomAbs_Circle
 import pathlib,math,sys
 out=pathlib.Path(__file__).resolve().parent;out.mkdir(exist_ok=True)
 cylinder=BRepPrimAPI_MakeCylinder(5,8).Shape()
@@ -20,7 +22,14 @@ outer=BRepPrimAPI_MakeCylinder(1,1).Shape();inner=BRepPrimAPI_MakeCylinder(0.999
 rotation=gp_Trsf();rotation.SetRotation(gp_Ax1(gp_Pnt(0,0,0),gp_Dir(0,0,1)),math.pi/24)
 inner=BRepBuilderAPI_Transform(inner,rotation,True).Shape()
 annulus=BRepAlgoAPI_Cut(outer,inner);annulus.Build();assert annulus.IsDone()
-for name,shape in [('cylinder-seam',cylinder),('shared-curved-edge',shared),('filleted-box',fillet.Shape()),('thin-annulus',annulus.Shape())]:
+long_cylinder=BRepPrimAPI_MakeCylinder(4.25,1000).Shape();rounded=BRepFilletAPI_MakeFillet(long_cylinder);explorer=TopExp_Explorer(long_cylinder,TopAbs_EDGE)
+while explorer.More():
+ edge=TopoDS.Edge_s(explorer.Current())
+ if BRepAdaptor_Curve(edge).GetType()==GeomAbs_Circle:rounded.Add(0.5,edge)
+ explorer.Next()
+rounded.Build();assert rounded.IsDone()
+rounded_shape=BRepBuilderAPI_Transform(rounded.Shape(),rotation,True).Shape()
+for name,shape in [('cylinder-seam',cylinder),('shared-curved-edge',shared),('filleted-box',fillet.Shape()),('thin-annulus',annulus.Shape()),('torus-fillet',rounded_shape)]:
  if len(sys.argv)>1 and name not in sys.argv[1:]:continue
  assert BRepCheck_Analyzer(shape).IsValid(),name
  writer=STEPControl_Writer();writer.Transfer(shape,STEPControl_AsIs);assert writer.Write(str(out/(name+'.step')))==IFSelect_RetDone
