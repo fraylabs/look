@@ -57,3 +57,8 @@ fn two_faces_sharing_a_curved_edge_are_closed_and_manifold() {
 fn filleted_box_is_closed_and_manifold() {
     assert_closed_fixture("filleted-box");
 }
+
+#[test]
+fn phase_offset_thin_annulus_is_closed_and_manifold() {
+    assert_closed_fixture("thin-annulus");
+}
