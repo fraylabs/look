@@ -15,7 +15,8 @@ fn occt_assy() {
 
 #[test]
 fn nullable_assembly_metadata_preserves_both_occurrences() {
-    let table = Table::from_step(include_str!("fixtures/assembly-pds-dollar.step")).unwrap();
+    let table =
+        Table::from_step(include_str!("fixtures/assembly-nullable-synthetic.step")).unwrap();
     assert_eq!(table.next_assembly_usage_occurrence.len(), 2);
     assert_eq!(table.product_definition_shape.len(), 4);
     assert_eq!(table.item_defined_transformation.len(), 2);

@@ -867,7 +867,11 @@ fn parse_step_table_assembly(
 
 /// One-product exports use already placed solid geometry. Keep void shells
 /// with their owning solid; never split a genuine assembly leaf this way.
-fn parse_flat_solids(table: Table, timings: &mut Timings, stats: &mut StepImportStats) -> anyhow::Result<StepAssemblyScene> {
+fn parse_flat_solids(
+    table: Table,
+    timings: &mut Timings,
+    stats: &mut StepImportStats,
+) -> anyhow::Result<StepAssemblyScene> {
     let mut mapped = Assembly::<Vec<u64>, PartAttrs, Matrix4, PartAttrs>::new();
     let root = mapped.create_node(NodeEntity {
         shape: Vec::new(),
