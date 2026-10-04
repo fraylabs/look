@@ -10040,6 +10040,7 @@ where
             surface,
             polyboundary,
             tol,
+            lattice,
             &mut roles,
             &support_uvs,
         );
@@ -10263,6 +10264,7 @@ fn insert_surface(
     surface: impl PreMeshableSurface,
     polyline: &PolyBoundary,
     tol: f64,
+    lattice: &CertifiedLattice,
     roles: &mut ConstraintRoles,
     extra_supports: &[Point2],
 ) -> (usize, usize) {
@@ -10341,6 +10343,40 @@ fn insert_surface(
             }
             div.sort_by(f64::total_cmp);
             div.dedup();
+        }
+    }
+    // A coarse periodic grid can connect an interior point to both copies of
+    // the seam along the same physical chord. After identifying the copies,
+    // that chord has four incident triangles. Split half-period sampling spans
+    // before inserting the grid, without adding or moving shared wire samples.
+    // Source-certified NURBS periods live in the lattice even when the native
+    // evaluator has no period accessor. Use that same evidence as the chart.
+    // Two passes also split a full-period span into quarters. Longer spans are
+    // left to the chart machinery; they are not evidence of a single orbit.
+    for (division, period) in [
+        (&mut udiv, lattice.declared_u_period()),
+        (&mut vdiv, lattice.declared_v_period()),
+    ] {
+        let Some(period) = period.filter(|p| p.is_finite() && *p > 0.0) else {
+            continue;
+        };
+        let margin = 64.0 * f64::EPSILON * period;
+        for _ in 0..2 {
+            let supports: Vec<_> = division
+                .windows(2)
+                .filter_map(|span| {
+                    let gap = span[1] - span[0];
+                    if gap.is_finite() && gap >= period * 0.5 - margin && gap <= period + margin {
+                        let midpoint = span[0] * 0.5 + span[1] * 0.5;
+                        (midpoint > span[0] && midpoint < span[1]).then_some(midpoint)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            division.extend(supports);
+            division.sort_by(f64::total_cmp);
+            division.dedup();
         }
     }
     let insert_res: Vec<Vec<Option<_>>> = udiv
@@ -17670,6 +17706,122 @@ mod shared_sample_conformity_tests {
     use super::*;
     use std::f64::consts::PI;
     use truck_geometry::prelude::{Cylinder, Line, Plane, RevolutedCurve};
+
+    /// A valid cylinder carrier whose coarse division crosses half a period.
+    /// The shared wire already has fine circle samples; interior sampling must
+    /// not identify the chords on the two sides of its periodic seam.
+    #[derive(Clone, Copy)]
+    struct CoarsePeriodicCylinder(Cylinder);
+
+    impl ParametricSurface for CoarsePeriodicCylinder {
+        type Point = Point3;
+        type Vector = Vector3;
+        fn subs(&self, u: f64, v: f64) -> Point3 {
+            self.0.subs(u, v)
+        }
+        fn uder(&self, u: f64, v: f64) -> Vector3 {
+            self.0.uder(u, v)
+        }
+        fn vder(&self, u: f64, v: f64) -> Vector3 {
+            self.0.vder(u, v)
+        }
+        fn uuder(&self, u: f64, v: f64) -> Vector3 {
+            self.0.uuder(u, v)
+        }
+        fn uvder(&self, u: f64, v: f64) -> Vector3 {
+            self.0.uvder(u, v)
+        }
+        fn vvder(&self, u: f64, v: f64) -> Vector3 {
+            self.0.vvder(u, v)
+        }
+        fn der_mn(&self, m: usize, n: usize, u: f64, v: f64) -> Vector3 {
+            self.0.der_mn(m, n, u, v)
+        }
+        // Like a source-certified NURBS, the evaluator itself advertises no period.
+    }
+    impl ParametricSurface3D for CoarsePeriodicCylinder {}
+    impl ParameterDivision2D for CoarsePeriodicCylinder {
+        fn parameter_division(
+            &self,
+            ((u0, u1), (v0, v1)): ((f64, f64), (f64, f64)),
+            _: f64,
+        ) -> (Vec<f64>, Vec<f64>) {
+            (vec![u0, (u0 + u1) * 0.5, u1], vec![v0, (v0 + v1) * 0.5, v1])
+        }
+    }
+
+    #[test]
+    fn full_period_coarse_grid_has_no_four_incident_seam_edge() {
+        let surface = CoarsePeriodicCylinder(
+            Cylinder::new(Point3::origin(), 1.0)
+                .expect("valid test cylinder")
+                .value,
+        );
+        let mut points = Vec::new();
+        for side in 0..4 {
+            for i in 0..16 {
+                let t = i as f64 / 16.0;
+                let uv = match side {
+                    0 => Point2::new(-PI + 2.0 * PI * t, -1.0),
+                    1 => Point2::new(PI, -1.0 + 2.0 * t),
+                    2 => Point2::new(PI - 2.0 * PI * t, 1.0),
+                    _ => Point2::new(-PI, 1.0 - 2.0 * t),
+                };
+                // Both uses of the shared seam retain the same source samples.
+                let world_u = if uv.x == -PI { PI } else { uv.x };
+                points.push(SurfacePoint::from((uv, surface.subs(world_u, uv.y))));
+            }
+        }
+        let sources: Vec<_> = (0..points.len())
+            .map(|i| {
+                vec![SourceEdgeUse {
+                    bound: BoundId(0),
+                    index: if i / 16 == 3 { 1 } else { i / 16 },
+                    orientation: i < 48,
+                }]
+            })
+            .collect();
+        let boundary = PolyBoundary(vec![BoundaryLoop::new(
+            points.clone(),
+            vec![SegmentOrigin::Source; points.len()],
+            sources,
+        )]);
+        let lattice = CertifiedLattice::revolution(Axis::U, AxisPeriodStatus::NonPeriodic);
+        let mesh = trimming_tessellation_result(&surface, &boundary, 2.0, &lattice)
+            .expect("the cylinder chart tessellates");
+        let mut unique: Vec<Point3> = Vec::new();
+        let ids: Vec<_> = mesh
+            .positions()
+            .iter()
+            .map(|p| {
+                if let Some(i) = unique.iter().position(|q| p.distance(*q) < 1.0e-10) {
+                    i
+                } else {
+                    unique.push(*p);
+                    unique.len() - 1
+                }
+            })
+            .collect();
+        let mut edges = std::collections::HashMap::new();
+        for tri in mesh.tri_faces() {
+            let tri = tri.map(|v| ids[v.pos]);
+            for (a, b) in [(tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])] {
+                *edges.entry((a.min(b), a.max(b))).or_insert(0usize) += 1;
+            }
+        }
+        assert!(
+            edges.values().all(|&n| n <= 2),
+            "periodic seam chords must not have four incident triangles"
+        );
+        for sample in points {
+            assert!(
+                mesh.positions()
+                    .iter()
+                    .any(|p| p.distance(sample.point) < 1.0e-10),
+                "interior support must preserve every shared wire sample"
+            );
+        }
+    }
 
     #[test]
     fn short_periodic_strip_preserves_its_source_wire() {
