@@ -4677,6 +4677,44 @@ fn untagged_sources(point_count: usize) -> Vec<SegmentSources> {
 #[derive(Debug, Default, Clone)]
 struct PolyBoundaryPiece(Vec<SurfacePoint>, Vec<SegmentSources>);
 
+/// Identifies a source point at a representation-certified sphere pole.
+/// The projection's polar parameter can carry inverse-trigonometric roundoff;
+/// the evidence is incidence with the primitive's exact pole image, measured
+/// at floating-point conditioning, never at the meshing tolerance.
+fn source_sphere_pole_uv<S: PreMeshableSurface>(
+    surface: &S,
+    point: Point3,
+    uv: Point2,
+    lattice: &CertifiedLattice,
+    ctx: &ToleranceCtx,
+) -> Option<(Axis, Point2)> {
+    let collapse = lattice.certified_collapse()?;
+    if collapse.witness != CollapseWitness::ExactSpherePole {
+        return None;
+    }
+    let (urange, vrange) = surface.try_range_tuple();
+    let (polar, range) = match collapse.polar {
+        Axis::U if lattice.v_generator().is_some() => (uv.x, urange?),
+        Axis::V if lattice.u_generator().is_some() => (uv.y, vrange?),
+        _ => return None,
+    };
+    for bound in [range.0, range.1] {
+        if !ctx.is_small_ratio(polar - bound) {
+            continue;
+        }
+        let pole_uv = match collapse.polar {
+            Axis::U => Point2::new(bound, uv.y),
+            Axis::V => Point2::new(uv.x, bound),
+        };
+        let pole = surface.subs(pole_uv.x, pole_uv.y);
+        let scale = point.to_vec().magnitude().max(pole.to_vec().magnitude());
+        if scale.is_finite() && pole.distance(point) <= validity::fp_rank_tolerance(scale) {
+            return Some((collapse.polar, pole_uv));
+        }
+    }
+    None
+}
+
 impl PolyBoundaryPiece {
     /// A piece whose segments carry no source attribution.
     ///
@@ -4806,6 +4844,32 @@ impl PolyBoundaryPiece {
         let mut first_failed_point: Option<Point3> = None;
         let mut previous: Option<(f64, f64)> = None;
         let mut previous_pt: Option<Point3> = None;
+        // A closed wire may start at a pole. Its closing source segment still
+        // supplies the incoming longitude: seed the lift from its last regular
+        // sample rather than from the pole projector's arbitrary coordinate.
+        if lattice
+            .certified_collapse()
+            .is_some_and(|collapse| collapse.witness == CollapseWitness::ExactSpherePole)
+        {
+            if let Some(first_uv) = sp(surface, bdry3d[0], None) {
+                if source_sphere_pole_uv(surface, bdry3d[0], Point2::from(first_uv), lattice, &ctx)
+                    .is_some()
+                {
+                    for &point in bdry3d.iter().rev() {
+                        let Some(uv) = sp(surface, point, None) else {
+                            continue;
+                        };
+                        if source_sphere_pole_uv(surface, point, Point2::from(uv), lattice, &ctx)
+                            .is_none()
+                        {
+                            previous = Some(uv);
+                            previous_pt = Some(point);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
         let mut vec: Vec<SurfacePoint> = Vec::with_capacity(bdry3d.len());
         // The source use each lifted point belongs to, parallel to `vec`. A
         // lift-refinement midpoint inherits the parent sample's source; the
@@ -4961,26 +5025,19 @@ impl PolyBoundaryPiece {
                         }
                     }
                 };
-                // At a representation-certified sphere pole, longitude is
-                // undefined. Keep the incoming representative before selecting
-                // a deck copy; the projector's arbitrary pole longitude must
-                // not send the departing meridian into a different chart.
-                if let (Some((u0, v0)), Some(collapse)) = (previous, lattice.certified_collapse()) {
-                    if collapse.witness == CollapseWitness::ExactSpherePole {
-                        match collapse.polar {
-                            Axis::U if vp_gen.is_some() => {
-                                if urange.is_some_and(|(lo, hi)| u == lo || u == hi) {
-                                    v = v0;
-                                }
-                            }
-                            Axis::V if up_gen.is_some() => {
-                                if vrange.is_some_and(|(lo, hi)| v == lo || v == hi) {
-                                    u = u0;
-                                }
-                            }
-                            _ => {}
+                // A certified source pole has no longitude. Normalize its
+                // polar coordinate from the primitive image and retain the
+                // incoming longitude before selecting the outgoing deck.
+                if let Some((polar_axis, mut pole_uv)) =
+                    source_sphere_pole_uv(surface, pt, Point2::new(u, v), lattice, &ctx)
+                {
+                    if let Some((u0, v0)) = previous {
+                        match polar_axis {
+                            Axis::U => pole_uv.y = v0,
+                            Axis::V => pole_uv.x = u0,
                         }
                     }
+                    (u, v) = (pole_uv.x, pole_uv.y);
                 }
                 // A nearest point is not an incidence.
                 //
@@ -17539,10 +17596,45 @@ mod shared_sample_conformity_tests {
 
     #[test]
     fn sphere_pole_longitude_does_not_change_the_shared_arc_chart() {
+        assert_spherical_octant_preserves_shared_arcs(0, 0.0);
+    }
+
+    #[test]
+    fn sphere_wire_starting_at_pole_preserves_shared_arcs() {
+        assert_spherical_octant_preserves_shared_arcs(1, 0.0);
+    }
+
+    #[test]
+    fn a_regular_source_point_near_a_pole_is_not_collapsed() {
+        let sphere = truck_geometry::prelude::Sphere::new(Point3::origin(), 0.03016);
+        let uv = Point2::new(1.4901161193847656e-8, 1.47262155637022);
+        let point = sphere.subs(uv.x, uv.y);
+        let ctx = ToleranceCtx::new(0.03016, TOLERANCE, TOLERANCE, TOLERANCE)
+            .expect("the sphere fixture has a finite model scale")
+            .value; // H-1: test fixture
+        assert!(
+            source_sphere_pole_uv(
+                &sphere,
+                point,
+                uv,
+                &CertifiedLattice::sphere_azimuth(Axis::V),
+                &ctx
+            )
+            .is_none(),
+            "near-pole geometry must not be pinned using a meshing or angular tolerance"
+        );
+    }
+
+    #[test]
+    fn sphere_pole_projection_roundoff_preserves_shared_arcs() {
+        assert_spherical_octant_preserves_shared_arcs(0, 1.4901161193847656e-8);
+    }
+
+    fn assert_spherical_octant_preserves_shared_arcs(first_edge: usize, pole_colatitude: f64) {
         let sphere = truck_geometry::prelude::Sphere::new(Point3::origin(), 0.03016);
         let incoming = 1.5 * PI;
         let outgoing = PI;
-        let arcs: Vec<Vec<Point3>> = vec![
+        let mut arcs: Vec<Vec<Point3>> = vec![
             (0..=16)
                 .map(|i| sphere.subs(0.5 * PI * (1.0 - i as f64 / 16.0), incoming))
                 .collect(),
@@ -17553,6 +17645,7 @@ mod shared_sample_conformity_tests {
                 .map(|i| sphere.subs(0.5 * PI, outgoing + 0.5 * PI * i as f64 / 16.0))
                 .collect(),
         ];
+        arcs.rotate_left(first_edge);
         let samples: Vec<Point3> = arcs
             .iter()
             .flat_map(|arc| arc.iter().take(16).copied())
@@ -17572,7 +17665,7 @@ mod shared_sample_conformity_tests {
             if point.distance(Point3::new(0.0, 0.0, 0.03016)) < 1e-12 {
                 // A pole has no longitude. A legal arbitrary representative
                 // must not select a different deck for the departing meridian.
-                Some((0.0, 1.47262155637022))
+                Some((pole_colatitude, 1.47262155637022))
             } else {
                 by_search_nearest_parameter(surface, point, hint)
             }
