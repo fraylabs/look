@@ -208,5 +208,34 @@ fn voron2_small_cylinder_retains_distinct_line_carriers() {
     // The original assembly declares 0.01-unit source uncertainty.
     shell.source_geometric_uncertainty = Some(0.01);
     let mesh = shell.triangulation(0.001);
-    assert!(mesh.faces[0].surface.is_some());
+    assert!(!mesh.faces[0]
+        .surface
+        .as_ref()
+        .unwrap()
+        .tri_faces()
+        .is_empty());
+}
+
+#[test]
+fn numerically_incident_line_vertices_remain_exactly_shared() {
+    use ruststep::tables::EntityTable;
+    use truck_geometry::prelude::*;
+    use truck_stepio::r#in::EdgeCurveHolder;
+    let table = table(
+        r#"
+#1=CARTESIAN_POINT('',(0.,0.,0.));
+#2=DIRECTION('',(1.,0.,0.));
+#3=VECTOR('',#2,1.);
+#4=LINE('',#1,#3);
+#5=CARTESIAN_POINT('',(1.,1.E-13,0.));
+#6=CARTESIAN_POINT('',(2.,1.E-13,0.));
+#7=VERTEX_POINT('',#5);
+#8=VERTEX_POINT('',#6);
+#9=EDGE_CURVE('',#7,#8,#4,.T.);
+"#,
+    );
+    let edge = EntityTable::<EdgeCurveHolder>::get_owned(&table, 9).unwrap();
+    let curve = edge.parse_curve3d().unwrap();
+    assert_eq!(curve.front(), Point3::new(1., 1.0E-13, 0.));
+    assert_eq!(curve.back(), Point3::new(2., 1.0E-13, 0.));
 }

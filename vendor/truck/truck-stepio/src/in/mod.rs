@@ -4073,7 +4073,18 @@ impl EdgeCurve {
                 // feature itself. Preserve the declared carrier, just as the
                 // 2D path does, instead of collapsing distinct parallel edges.
                 let line = truck::Line::<Point3>::from(line.as_ref());
-                Curve3D::Line(Line(line.projection(p), line.projection(q)))
+                let endpoint = |point| {
+                    let projected = line.projection(point);
+                    // Keep numerically incident shared vertices exact. Moving
+                    // them by roundoff can create contradictory trim parity.
+                    // Larger source uncertainty still preserves the carrier.
+                    if ctx.near_pt(projected, point) {
+                        point
+                    } else {
+                        projected
+                    }
+                };
+                Curve3D::Line(Line(endpoint(p), endpoint(q)))
             }
             CurveAny::BoundedCurve(b) => b.as_ref().try_into()?,
             CurveAny::Conic(curve) => match curve.as_ref() {
