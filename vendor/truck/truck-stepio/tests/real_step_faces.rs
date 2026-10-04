@@ -59,14 +59,14 @@ fn freecad_hyperbola_face_survives_conversion() {
 }
 
 #[test]
-fn nonpositive_torus_is_a_typed_face_refusal() {
+fn zero_major_torus_is_a_typed_face_refusal() {
     let table = table(
         r#"
 #1=CARTESIAN_POINT('',(0.,0.,0.));
 #2=DIRECTION('',(0.,0.,1.));
 #3=DIRECTION('',(1.,0.,0.));
 #4=AXIS2_PLACEMENT_3D('',#1,#2,#3);
-#5=TOROIDAL_SURFACE('',#4,-1.55,5.0);
+#5=TOROIDAL_SURFACE('',#4,0.0,5.0);
 #6=ADVANCED_FACE('',(),#5,.T.);
 #7=OPEN_SHELL('',(#6));
 "#,
@@ -239,4 +239,130 @@ fn numerically_incident_line_vertices_remain_exactly_shared() {
     let curve = edge.parse_curve3d().unwrap();
     assert_eq!(curve.front(), Point3::new(1., 1.0E-13, 0.));
     assert_eq!(curve.back(), Point3::new(2., 1.0E-13, 0.));
+}
+
+#[test]
+fn negative_major_torus_preserves_occt_geometry_parameterisation() {
+    use ruststep::tables::EntityTable;
+    use truck_stepio::r#in::{step_geometry::*, ToroidalSurfaceHolder};
+    // Synthetic SolidWorks/ProE convention, as implemented by OCCT 7.9.3:
+    // StepToGeom takes abs(major), StepToTopoDS reverses the face sense.
+    let table = table(
+        r#"
+#1=CARTESIAN_POINT('',(0.,0.,0.));
+#2=DIRECTION('',(0.,0.,1.));
+#3=DIRECTION('',(1.,0.,0.));
+#4=AXIS2_PLACEMENT_3D('',#1,#2,#3);
+#5=TOROIDAL_SURFACE('',#4,-1.55,5.0);
+"#,
+    );
+    let source = EntityTable::<ToroidalSurfaceHolder>::get_owned(&table, 5).unwrap();
+    let surface = ToroidalSurface::try_from(&source).expect("signed STEP major radius");
+    assert_eq!(surface.entity().large_radius(), 1.55);
+    assert!(surface.orientation());
+    for (u, v) in [(0.4_f64, 0.2_f64), (1.1, 2.7), (2.2, 3.1), (4.1, 3.8)] {
+        let radius = 1.55 + 5.0 * v.cos();
+        let expected = Point3::new(radius * u.cos(), radius * u.sin(), 5.0 * v.sin());
+        // The carrier keeps native STEP UV; face sense is separate.
+        assert!(surface.subs(u, v).distance(expected) < 1e-12);
+        let uv = surface.search_parameter(expected, None, 100).unwrap();
+        assert!(surface.subs(uv.0, uv.1).distance(expected) < 1e-10);
+        let nearest = surface
+            .search_nearest_parameter(expected, None, 100)
+            .unwrap();
+        assert!(surface.subs(nearest.0, nearest.1).distance(expected) < 1e-10);
+        let outward = Vector3::new(v.cos() * u.cos(), v.cos() * u.sin(), v.sin()) * radius.signum();
+        assert!((surface.normal(u, v) - outward).magnitude() < 1e-12);
+    }
+}
+
+#[test]
+fn spindle_torus_folded_sheet_inverse_and_normal_match_its_derivatives() {
+    use truck_stepio::r#in::step_geometry::*;
+    let torus = Torus::new(Point3::origin(), 1.55, 5.0);
+    let (u, v) = (0.7, 3.1);
+    let point = torus.subs(u, v);
+    let uv = torus
+        .search_parameter(point, None, 100)
+        .expect("inner spindle sheet inverse");
+    assert!(torus.subs(uv.0, uv.1).distance(point) < 1e-10);
+    let nearest = torus.search_nearest_parameter(point, None, 100).unwrap();
+    assert!(torus.subs(nearest.0, nearest.1).distance(point) < 1e-10);
+    assert!(
+        (torus.normal(u, v) - torus.uder(u, v).cross(torus.vder(u, v)).normalize()).magnitude()
+            < 1e-12
+    );
+}
+
+#[test]
+fn negative_torus_pcurve_keeps_source_uv_coordinates() {
+    use ruststep::tables::EntityTable;
+    use truck_stepio::r#in::{step_geometry::*, PcurveHolder};
+    let table = table(
+        r#"
+#1=CARTESIAN_POINT('',(0.,0.,0.));
+#2=DIRECTION('',(0.,0.,1.));
+#3=DIRECTION('',(1.,0.,0.));
+#4=AXIS2_PLACEMENT_3D('',#1,#2,#3);
+#5=TOROIDAL_SURFACE('',#4,-1.55,5.0);
+#6=CARTESIAN_POINT('',(0.4,0.2));
+#7=DIRECTION('',(1.,0.));
+#8=VECTOR('',#7,1.);
+#9=LINE('',#6,#8);
+#10=REPRESENTATION_CONTEXT('','');
+#11=DEFINITIONAL_REPRESENTATION('',(#9),#10);
+#12=PCURVE('',#5,#11);
+"#,
+    );
+    let source = EntityTable::<PcurveHolder>::get_owned(&table, 12).unwrap();
+    let curve = PCurve::try_from(&source).unwrap();
+    let (u, v) = (0.4_f64, 0.2_f64);
+    let radius = 1.55 + 5.0 * v.cos();
+    assert!(
+        curve.subs(0.0).distance(Point3::new(
+            radius * u.cos(),
+            radius * u.sin(),
+            5.0 * v.sin()
+        )) < 1e-12
+    );
+}
+
+#[test]
+fn signed_torus_reverses_bounds_and_preserves_declared_face_sense() {
+    use truck_stepio::r#in::step_geometry::*;
+    let table =
+        Table::from_step(include_str!("input/fixtures/negative-torus-synthetic.step")).unwrap();
+    let (shell, losses) = table
+        .to_compressed_shell_with_losses(102, &table.shell[&102])
+        .unwrap();
+    assert!(losses.is_empty(), "{losses:?}");
+    assert_eq!(shell.faces.len(), 2);
+    let positive = Table::from_step(
+        &include_str!("input/fixtures/negative-torus-synthetic.step").replace("-1.55", "1.55"),
+    )
+    .unwrap();
+    let original = positive
+        .to_compressed_shell(102, &positive.shell[&102])
+        .unwrap();
+    for (signed, unsigned) in shell.faces.iter().zip(&original.faces) {
+        let expected: Vec<_> = unsigned.boundaries[0]
+            .iter()
+            .rev()
+            .map(|edge| (edge.index, !edge.orientation))
+            .collect();
+        let actual: Vec<_> = signed.boundaries[0]
+            .iter()
+            .map(|edge| (edge.index, edge.orientation))
+            .collect();
+        assert_eq!(actual, expected);
+    }
+    let u = 0.4_f64;
+    let v = 0.2_f64;
+    let radius = 1.55 + 5.0 * v.cos();
+    let expected = Point3::new(radius * u.cos(), radius * u.sin(), 5.0 * v.sin());
+    let normal = Vector3::new(v.cos() * u.cos(), v.cos() * u.sin(), v.sin());
+    assert!(shell.faces[0].surface.subs(u, v).distance(expected) < 1e-12);
+    assert!((shell.faces[0].surface.normal(u, v) - normal).magnitude() < 1e-12);
+    assert!(shell.faces[1].surface.subs(v, u).distance(expected) < 1e-12);
+    assert!((shell.faces[1].surface.normal(v, u) + normal).magnitude() < 1e-12);
 }

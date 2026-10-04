@@ -282,6 +282,23 @@ impl Table {
         .ok_or(FaceLossReason::WireNotClosed)
     }
 
+    /// OCCT's SolidWorks/ProE convention reverses bound wires for a negative
+    /// major radius, while the face retains its declared SameSense. Keep this
+    /// separate from carrier conversion so pcurves retain the native UV chart.
+    fn source_reverses_torus_bounds(&self, face: &FaceSurfaceHolder) -> bool {
+        if let PlaceHolder::Ref(Name::Entity(id)) = &face.face_geometry {
+            return self
+                .toroidal_surface
+                .get(id)
+                .is_some_and(|torus| torus.major_radius < 0.0);
+        }
+        let Ok(SurfaceAny::ElementarySurface(source)) = face.face_geometry.clone().into_owned(self)
+        else {
+            return false;
+        };
+        matches!(source.as_ref(), ElementarySurfaceAny::ToroidalSurface(torus) if torus.major_radius < 0.0)
+    }
+
     /// The supporting surface of a face, converted once per source entity.
     ///
     /// Surfaces are the third entity kind to resolve through the one generic
@@ -495,6 +512,7 @@ impl Table {
                 surface_id: surface_id.map(SourceEntityId::new),
                 ..partial
             };
+            let reverse_bounds = self.source_reverses_torus_bounds(&face);
             if !face.same_sense && std::env::var_os("TRUCK_NO_INVERT").is_none() {
                 surface.invert()
             }
@@ -580,7 +598,16 @@ impl Table {
                 // (§31a) now permits.
                 boundaries: wires
                     .into_iter()
-                    .map(TopologicallyClosedWire::into_edges)
+                    .map(|wire| {
+                        let mut edges = wire.into_edges();
+                        if reverse_bounds {
+                            edges.reverse();
+                            for edge in &mut edges {
+                                edge.orientation = !edge.orientation;
+                            }
+                        }
+                        edges
+                    })
                     .collect(),
                 orientation,
                 // The whole reference chain, not one collapsed id. Every later
