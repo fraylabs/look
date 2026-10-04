@@ -1,3 +1,5 @@
+#![deny(clippy::unwrap_used)]
+
 //! Shared BREP edges must produce the same mesh boundary on every incident face.
 use truck_meshalgo::prelude::*;
 use truck_modeling::*;

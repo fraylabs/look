@@ -4710,30 +4710,16 @@ impl PolyBoundaryPiece {
         // assembly -- or one piece that the lift doubles. This separates them.
         let mut piece_lengths: Vec<usize> = Vec::new();
         // The flattened 3D samples, and the source edge use each one came from.
-        // A point inside a straight edge's N=8 expansion belongs to that edge;
-        // a lift-refinement midpoint inherits its parent sample's source; a
-        // degenerate-periodic reconstruction belongs to nothing.
+        // These are the shell's shared edge samples, without face-local
+        // subdivision. A degenerate-periodic reconstruction belongs to nothing.
         let mut bdry3d: Vec<Point3> = Vec::new();
         let mut source_tags: Vec<Option<SourceEdgeUse>> = Vec::new();
         for poly_edge in wire {
             piece_lengths.push(poly_edge.curve.len());
             let source = poly_edge.source;
-            if poly_edge.curve.len() == 2 {
-                let p0 = poly_edge.curve[0];
-                let p1 = poly_edge.curve[1];
-                let mut pts = Vec::new();
-                const N: usize = 8;
-                for i in 0..N {
-                    let frac = i as f64 / N as f64;
-                    pts.push(p0 + (p1 - p0) * frac);
-                }
-                bdry3d.extend(pts);
-                source_tags.extend(std::iter::repeat_n(Some(source), N));
-            } else {
-                let n = poly_edge.curve.len().saturating_sub(1);
-                bdry3d.extend(poly_edge.curve.into_iter().take(n));
-                source_tags.extend(std::iter::repeat_n(Some(source), n));
-            }
+            let n = poly_edge.curve.len().saturating_sub(1);
+            bdry3d.extend(poly_edge.curve.into_iter().take(n));
+            source_tags.extend(std::iter::repeat_n(Some(source), n));
         }
         // A wire that contributed no points cannot bound a face. This
         // constructor is already fallible, so say so rather than closing the
@@ -10149,7 +10135,44 @@ fn insert_surface(
         .map(std::ops::Deref::deref)
         .collect();
     let range = ((bdb.min()[0], bdb.max()[0]), (bdb.min()[1], bdb.max()[1]));
-    let (udiv, vdiv) = surface.parameter_division(range, tol);
+    let (mut udiv, mut vdiv) = surface.parameter_division(range, tol);
+    // A periodic strip needs interior rows in its transverse direction.
+    // A flat generatrix supplies only the two trim endpoints; angular grid
+    // samples then lie on source trims that cannot be split locally. Broad
+    // CDT triangles can span a cylinder's diameter and overlap triangles from
+    // an adjoining chart. Reuse the transverse coordinates already sampled
+    // on the shell boundary as interior support rows, preserving every shared
+    // edge sample. A midpoint also supplies support when no interior source
+    // coordinate exists.
+    for (axis, div, transverse_periodic) in [
+        (0, &mut udiv, surface.v_period().is_some()),
+        (1, &mut vdiv, surface.u_period().is_some()),
+    ] {
+        if transverse_periodic
+            && div.len() == 2
+            && polyline
+                .0
+                .iter()
+                .any(|loop_| loop_.source_uses.iter().any(|uses| !uses.is_empty()))
+        {
+            let lo = div[0].min(div[1]);
+            let hi = div[0].max(div[1]);
+            div.extend(
+                polyline
+                    .0
+                    .iter()
+                    .flat_map(|loop_| loop_.points.iter())
+                    .map(|point| point.uv[axis])
+                    .filter(|&value| value.is_finite() && value > lo && value < hi),
+            );
+            let midpoint = lo * 0.5 + hi * 0.5;
+            if midpoint.is_finite() && midpoint > lo && midpoint < hi {
+                div.push(midpoint);
+            }
+            div.sort_by(f64::total_cmp);
+            div.dedup();
+        }
+    }
     let insert_res: Vec<Vec<Option<_>>> = udiv
         .iter()
         .copied()
@@ -11343,10 +11366,13 @@ impl CollapsedPeriodicBoundaryPair {
         // an explicit source seam also spans a period, but its two latitudes
         // already bound a complete chart cell. Closing that cell to an apex
         // invents material and emits overlapping triangles at the seam.
-        let ctx = ToleranceCtx::unscaled_legacy();
+        let bounds: BoundingBox<Point3> = loop0.iter().map(|p| p.point).collect();
+        let Ok(ctx) = ToleranceCtx::new(bounds.diameter(), TOLERANCE, TOLERANCE, TOLERANCE) else {
+            return None;
+        };
         if loop0.iter().any(|p| {
             let radial = if is_v { p.uv.x } else { p.uv.y };
-            !ctx.is_small_ratio(radial - base_r)
+            !ctx.value.is_small_ratio(radial - base_r)
         }) {
             return None;
         }
@@ -15754,6 +15780,22 @@ mod sphere_pole_recovery_tests {
         index: usize,
         orientation: bool,
     ) -> SourcePolyline {
+        // Shared-edge sampling owns the great-circle subdivisions. Boundary
+        // lifting must not invent its own chord points for either incident face.
+        let pts = if pts.len() == 2 {
+            let a = pts[0].to_vec().normalize();
+            let b = pts[1].to_vec().normalize();
+            let angle = a.dot(b).clamp(-1.0, 1.0).acos();
+            (0..=8)
+                .map(|i| {
+                    let t = i as f64 / 8.0;
+                    let v = (a * ((1.0 - t) * angle).sin() + b * (t * angle).sin()) / angle.sin();
+                    Point3::from_vec(v * R)
+                })
+                .collect()
+        } else {
+            pts
+        };
         SourcePolyline {
             curve: PolylineCurve(pts),
             source: use_(bound, index, orientation),
@@ -15777,7 +15819,7 @@ mod sphere_pole_recovery_tests {
             wire_edge(vec![a, mid0, p], 0, 0, true),
             // meridian v = 3.3, P -> B; the pole is the polyline's first point.
             wire_edge(vec![p, mid1, b], 0, 1, true),
-            // great circle B -> A, expanded to a chord by `try_new`.
+            // Shared samples of the great circle B -> A.
             wire_edge(vec![b, a], 0, 2, true),
         ]
     }
@@ -17457,7 +17499,154 @@ mod diag002_contract_tests {
 mod shared_sample_conformity_tests {
     use super::*;
     use std::f64::consts::PI;
-    use truck_geometry::prelude::{Line, Plane, RevolutedCurve};
+    use truck_geometry::prelude::{Cylinder, Line, Plane, RevolutedCurve};
+
+    #[test]
+    fn adjoining_cylinder_charts_have_no_overlapping_material() {
+        let cylinder = Cylinder::new(Point3::origin(), 1.5)
+            .expect("valid cylinder radius")
+            .value; // H-1: test fixture
+        let mut unique: Vec<Point3> = Vec::new();
+        let mut edges = std::collections::HashMap::<(usize, usize), usize>::new();
+        for half in 0..2 {
+            let phase = half as f64 * PI;
+            let mut points: Vec<SurfacePoint> = Vec::new();
+            for i in 0..12 {
+                let v = phase + PI * i as f64 / 12.0;
+                points.push((Point2::new(v, -35.8), cylinder.subs(v, -35.8)).into());
+            }
+            for i in 0..16 {
+                let u = -35.8 + 7.9 * i as f64 / 16.0;
+                points.push((Point2::new(phase + PI, u), cylinder.subs(phase + PI, u)).into());
+            }
+            for i in 0..2 {
+                let v = phase + PI * (1.0 - i as f64 / 2.0);
+                points.push((Point2::new(v, -27.9), cylinder.subs(v, -27.9)).into());
+            }
+            for i in 0..16 {
+                let u = -27.9 - 7.9 * i as f64 / 16.0;
+                points.push((Point2::new(phase, u), cylinder.subs(phase, u)).into());
+            }
+            let n = points.len();
+            let source = SourceEdgeUse {
+                bound: BoundId(0),
+                index: 0,
+                orientation: true,
+            };
+            let boundary = PolyBoundary(vec![BoundaryLoop::new(
+                points,
+                vec![SegmentOrigin::Source; n],
+                vec![vec![source]; n],
+            )]);
+            let mesh = trimming_tessellation_result(
+                &cylinder,
+                &boundary,
+                0.1,
+                &unevidenced_lattice(&cylinder),
+            )
+            .expect("regular half cylinder meshes"); // H-1: test fixture
+            let ids: Vec<usize> = mesh
+                .positions()
+                .iter()
+                .map(|&p| {
+                    if let Some(i) = unique.iter().position(|q| p.near(q)) {
+                        i
+                    } else {
+                        unique.push(p);
+                        unique.len() - 1
+                    }
+                })
+                .collect();
+            for tri in mesh.tri_faces() {
+                let mut key = [ids[tri[0].pos], ids[tri[1].pos], ids[tri[2].pos]];
+                key.sort();
+                for (a, b) in [(key[0], key[1]), (key[1], key[2]), (key[0], key[2])] {
+                    *edges.entry((a, b)).or_default() += 1;
+                }
+            }
+        }
+        assert!(
+            edges.values().all(|&count| count <= 2),
+            "adjoining cylinder charts must not overlap along their shared seams"
+        );
+    }
+
+    #[test]
+    fn stretched_cylinder_chart_has_no_overlapping_triangles() {
+        let cylinder = RevolutedCurve::by_revolution(
+            Line(Point3::new(1.45, 0.0, 0.0), Point3::new(1.45, 0.0, 1000.0)),
+            Point3::origin(),
+            Vector3::unit_z(),
+        );
+        let height = 6.2 / 1000.0;
+        let phase = 0.17;
+        let mut points: Vec<SurfacePoint> = Vec::new();
+        for i in 0..24 {
+            let v = phase - 2.0 * PI * i as f64 / 24.0;
+            points.push((Point2::new(height, v), cylinder.subs(height, v)).into());
+        }
+        for i in 0..16 {
+            let u = height * (1.0 - i as f64 / 16.0);
+            let v = phase - 2.0 * PI;
+            points.push((Point2::new(u, v), cylinder.subs(u, v)).into());
+        }
+        for i in 0..24 {
+            let v = phase - 2.0 * PI + 2.0 * PI * i as f64 / 24.0;
+            points.push((Point2::new(0.0, v), cylinder.subs(0.0, v)).into());
+        }
+        for i in 0..16 {
+            let u = height * i as f64 / 16.0;
+            points.push((Point2::new(u, phase), cylinder.subs(u, phase)).into());
+        }
+        let n = points.len();
+        let source = SourceEdgeUse {
+            bound: BoundId(0),
+            index: 0,
+            orientation: true,
+        };
+        let boundary = PolyBoundary(vec![BoundaryLoop::new(
+            points,
+            vec![SegmentOrigin::Source; n],
+            vec![vec![source]; n],
+        )]);
+        let mesh = trimming_tessellation_result(
+            &cylinder,
+            &boundary,
+            0.1,
+            &unevidenced_lattice(&cylinder),
+        )
+        .expect("a regular cylinder chart must mesh"); // H-1: test fixture
+        let mut unique: Vec<Point3> = Vec::new();
+        let ids: Vec<usize> = mesh
+            .positions()
+            .iter()
+            .map(|&p| {
+                if let Some(i) = unique.iter().position(|q| p.near(q)) {
+                    i
+                } else {
+                    unique.push(p);
+                    unique.len() - 1
+                }
+            })
+            .collect();
+        let mut triangles = std::collections::HashSet::new();
+        let mut edges = std::collections::HashMap::<(usize, usize), usize>::new();
+        for tri in mesh.tri_faces() {
+            let mut key = [ids[tri[0].pos], ids[tri[1].pos], ids[tri[2].pos]];
+            key.sort();
+            assert!(
+                triangles.insert(key),
+                "the periodic chart must not cover a world triangle twice"
+            );
+            for (a, b) in [(key[0], key[1]), (key[1], key[2]), (key[0], key[2])] {
+                *edges.entry((a, b)).or_default() += 1;
+            }
+        }
+        assert!(
+            edges.values().all(|&count| count <= 2),
+            "a cylinder's seam must not acquire overlapping material"
+        );
+    }
 
     #[test]
     fn seam_bounded_cone_band_does_not_invent_an_apex() {
@@ -17488,6 +17677,47 @@ mod shared_sample_conformity_tests {
             .is_none(),
             "a seam-bounded annulus has no collapsed apex boundary"
         );
+    }
+
+    #[test]
+    fn short_straight_edges_preserve_shared_source_samples() {
+        let plane = Plane::new(
+            Point3::origin(),
+            Point3::new(1.0, 0.0, 0.0),
+            Point3::new(0.0, 1.0, 0.0),
+        );
+        let samples = [
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(0.00005, 0.0, 0.0),
+            Point3::new(0.0, 0.00005, 0.0),
+        ];
+        let wire = (0..3).map(|i| SourcePolyline {
+            curve: PolylineCurve::from(vec![samples[i], samples[(i + 1) % 3]]),
+            source: SourceEdgeUse {
+                bound: BoundId(0),
+                index: i,
+                orientation: true,
+            },
+        });
+        let piece = PolyBoundaryPiece::try_new(
+            &plane,
+            wire,
+            by_search_nearest_parameter,
+            0.1,
+            &unevidenced_lattice(&plane),
+        )
+        .expect("a short planar wire lifts"); // H-1: test fixture
+        assert_eq!(
+            piece.0.len(),
+            4,
+            "lifting must preserve the shared source sample count"
+        );
+        for (lifted, sample) in piece.0.iter().zip(samples.iter().cycle()) {
+            assert_eq!(
+                lifted.point, *sample,
+                "no face-local straight-edge subdivisions"
+            );
+        }
     }
 
     #[test]

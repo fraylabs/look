@@ -1,9 +1,11 @@
 {
   "id": "BURR-MESH-CONFORMITY",
   "status": "DONE",
-  "contracts": ["BURR-MESH-CONFORMITY"],
+  "contracts": [
+    "BURR-MESH-CONFORMITY"
+  ],
   "class": "corrective",
-  "tests_added": 5,
+  "tests_added": 8,
   "anchors_verified": {
     "cshell_tessellation_inner_definition": 1,
     "PolyBoundaryPiece_try_new_definition": 1,
@@ -14,15 +16,17 @@
     "test_first": [
       "shared_curved_edge_preserves_source_samples: failed with 6 lifted points versus 4 source samples before synthetic-emission fix",
       "shell_endpoints_share_source_vertex: failed with evaluated endpoint -0.999996 versus source -1 before endpoint realization fix",
-      "seam_bounded_cone_band_does_not_invent_an_apex: failed before latitude-orbit classifier guard"
+      "seam_bounded_cone_band_does_not_invent_an_apex: failed before latitude-orbit classifier guard",
+      "short_straight_edges_preserve_shared_source_samples: failed with25 liftedpoints vs4 canonical before removingface-localN8 expansion",
+      "adjoining_cylinder_charts_have_no_overlapping_material: actual Cylinder carrier failed with overlappingworldedges before transverse supportrows"
     ],
-    "focused_after": "2 library regressions and 3 mesh_conformity tests pass",
-    "library_after": "211 passed, 1 pre-existing ignored",
+    "focused_after": "5 library regressions and3 mesh_conformity tests pass",
+    "library_after": "214 passed,1 pre-existing ignored",
     "legacy_tessellation": "6 passed, 4 failures identical on base 84c7d60 and after: 2 missing OCCT OBJ fixture and 2 existing sphere.json closure failures",
     "crate_check": "cargo check --locked -p truck-meshalgo passed",
     "format": "rustfmt --check for both modified Rust files passed",
-    "downstream": "Root reports 3 OCCT-valid STEP synthetic integration fixtures pass, including previously open shared-curved-edge fixture"
+    "downstream": "Root STEP fixture rerun blocked by temporary diagnostics hook compile E0282 at src/step.rs:727; root owns hook removal/fix and rerun."
   },
-  "notes": "Compressed shell already sampled each BREP edge once. Preserve that set: face-local periodic-lift chord midpoints are now hint-only, and admitted edge endpoints realize common BREP vertices within the existing source/caller incidence tolerance. Periodic cone annuli with explicit seams were wrongly classified as apex caps solely because their angular span covered a period; requiring a constant radial latitude prevents invented apex geometry and duplicated periodic material. Apollo face #6375 source UV cell u0.142857..0.857143/v0..TAU was expanded to false apex u-0.639455. No dependency, API, tolerance-policy broadening, hole filling, invalid-solid closure claim, existing-test weakening, or baseline warning suppression.",
+  "notes": "Compressed shell already sampled each BREP edge once. Preserve that set: face-local periodic-lift chord midpoints are now hint-only, and admitted edge endpoints realize common BREP vertices within the existing source/caller incidence tolerance. Periodic cone annuli with explicit seams were wrongly classified as apex caps solely because their angular span covered a period; requiring a constant radial latitude prevents invented apex geometry and duplicated periodic material. Apollo face #6375 source UV cell u0.142857..0.857143/v0..TAU was expanded to false apex u-0.639455. No dependency, API, tolerance-policy broadening, hole filling, invalid-solid closure claim, existing-test weakening, or baseline warning suppression. Residual amendment removes two-sample edge face-localN8 expansion. Periodic strips with source-attributed boundaries andflattransverse2pointgrid reuse sharedboundary transversecoordinates plusmidpoint as genuineinterior supportrows; native adjoininghalf-cylinder regression proved one rowinsufficient butcanonicalrows remove diameter-planeoverlap. Existing spherepolefixtures nowprovide8 shared genuine great-circlesamples instead ofrelying onlocalboundaryexpansion; assertions unchanged. The coneclassifier uses realboundarymodelscale without addinga legacy tolerancecontext; integrationtestcrate explicitlydeniesunwrap.",
   "limitations": "Root owns full corpus after-measurement, OCCT validity matching, packet verify.py, CI and publishing. Existing legacy sphere closure failures and missing OCCT fixture are documented baseline defects. Invalid BREP and touching distinct solids must not be forced into a closed aggregate mesh. Pending corpus findings may require a follow-up packet amendment."
 }
