@@ -322,8 +322,26 @@ fn flat_multi_solid_export_keeps_each_solid_as_a_component() {
         }
     }
     text.push_str("ENDSEC;END-ISO-10303-21;");
-    let scene = parse_step_scene(text.as_bytes(), &mut Timings::default()).unwrap();
+    let (scene, stats) =
+        look::step::parse_step_scene_with_stats(text.as_bytes(), &mut Timings::default()).unwrap();
     assert!(matches!(scene, StepScene::Assembly(ref assembly) if assembly.occurrences.len() == 2));
+    assert_eq!(stats.declared_faces, 1);
+    assert_eq!(stats.lost_faces, 0);
+
+    // One unsupported face in the shared shell must be counted once even
+    // when the flat solid splitter creates two definitions that refer to it.
+    let damaged = text
+        .replace("CLOSED_SHELL('',(#128))", "CLOSED_SHELL('',(#128,#999))")
+        .replace(
+            "ENDSEC;END-ISO-10303-21;",
+            "#999 = ADVANCED_FACE('',(#127),#99999,.T.);ENDSEC;END-ISO-10303-21;",
+        );
+    let (scene, stats) =
+        look::step::parse_step_scene_with_stats(damaged.as_bytes(), &mut Timings::default())
+            .unwrap();
+    assert!(matches!(scene, StepScene::Assembly(ref assembly) if assembly.occurrences.len() == 2));
+    assert_eq!(stats.declared_faces, 2);
+    assert_eq!(stats.lost_faces, 1);
 }
 
 #[test]
@@ -425,7 +443,7 @@ fn face_census_counts_definitions_once_instead_of_occurrences() {
     let (_, stats) =
         look::step::parse_step_scene_with_stats(FIXTURE.as_bytes(), &mut Timings::default())
             .unwrap();
-    // Three definition nodes share one source triangle shell; five occurrences.
+    // Geometry-bearing definitions share one source triangle shell; empty leaves survive.
     assert_eq!(stats.declared_faces, 1);
     assert_eq!(stats.lost_faces, 0);
 }
