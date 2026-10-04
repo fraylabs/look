@@ -1,3 +1,4 @@
+use truck_stepio::r#in::convert::ProductShape;
 use truck_stepio::r#in::*;
 
 const STEP_DIRECTORY: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../resources/step/");
@@ -25,4 +26,42 @@ fn nullable_assembly_metadata_preserves_both_occurrences() {
         .expect("nullable metadata must retain the graph");
     assert_eq!(assy.all_edges().count(), 2);
     assert_eq!(assy.top_nodes().count(), 1);
+}
+
+#[test]
+fn manifold_surface_representation_retains_linked_shells_and_occurrences() {
+    // Entirely synthetic entity graph: two placements of one shell model.
+    let source = include_str!("fixtures/assembly-nullable-synthetic.step")
+        .replace("ENDSEC;\nEND-ISO-10303-21;", "#60=OPEN_SHELL('',());\n#61=SHELL_BASED_SURFACE_MODEL('',(#60));\n#62=MANIFOLD_SURFACE_SHAPE_REPRESENTATION('',(#33,#61),#4);\n#63=SHAPE_REPRESENTATION_RELATIONSHIP('',$,#41,#62);\nENDSEC;\nEND-ISO-10303-21;");
+    let table = Table::from_step(&source).unwrap();
+    assert!(table.shape_representation.contains_key(&62));
+    let assy = table
+        .step_assy()
+        .expect("linked surface geometry must retain the graph");
+    assert_eq!(assy.all_edges().count(), 2);
+    let root = assy.top_nodes().next().unwrap();
+    let paths = assy.maximal_paths_iter(root.index()).collect::<Vec<_>>();
+    assert_eq!(paths.len(), 2);
+    let mut translations = Vec::new();
+    for path in paths {
+        let matrix = step_geometry::Matrix4::try_from(path.edges()[0].matrix()).unwrap();
+        translations.push((matrix.w.x, matrix.w.y, matrix.w.z));
+        let child = path.terminal_node();
+        assert!(child
+            .entity()
+            .shape
+            .iter()
+            .any(|shape| matches!(shape, ProductShape::Shells(_, ids) if ids == &[60])));
+    }
+    translations.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    assert_eq!(translations, [(0.0, 11.0, 0.0), (7.0, 0.0, 0.0)]);
+    // The same subtype can also be used directly by the SDR.
+    let direct = source
+        .replace(
+            "#41=SHAPE_REPRESENTATION('child',(#33),#4);",
+            "#41=MANIFOLD_SURFACE_SHAPE_REPRESENTATION('child',(#33,#61),#4);",
+        )
+        .replace("#63=SHAPE_REPRESENTATION_RELATIONSHIP('',$,#41,#62);", "");
+    let table = Table::from_step(&direct).unwrap();
+    assert_eq!(table.step_assy().unwrap().all_edges().count(), 2);
 }

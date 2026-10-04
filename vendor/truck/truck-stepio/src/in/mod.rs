@@ -780,11 +780,12 @@ impl Table {
                         self.shape_definition_representation
                             .insert(*id, Deserialize::deserialize(&record.parameter)?);
                     }
-                    "SHAPE_REPRESENTATION" => {
-                        self.shape_representation
-                            .insert(*id, Deserialize::deserialize(&record.parameter)?);
-                    }
-                    "ADVANCED_BREP_SHAPE_REPRESENTATION" => {
+                    // These subtypes add no attributes to SHAPE_REPRESENTATION.
+                    // Surface models can be definition geometry linked from a
+                    // frame-only representation, just like solid BREPs.
+                    "SHAPE_REPRESENTATION"
+                    | "ADVANCED_BREP_SHAPE_REPRESENTATION"
+                    | "MANIFOLD_SURFACE_SHAPE_REPRESENTATION" => {
                         self.shape_representation
                             .insert(*id, Deserialize::deserialize(&record.parameter)?);
                     }
