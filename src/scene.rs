@@ -92,6 +92,8 @@ pub struct SourceMaterial {
 pub struct Geometry {
     pub vertices: Vec<Vertex>,
     pub source_attributes: Option<Vec<SourceVertexAttributes>>,
+    /// STEP evaluator normals, separate from the rendering normals.
+    pub surface_normals: Option<Vec<[f32; 3]>>,
     pub indices: Vec<u32>,
     pub bounds: Bounds,
     pub bounding_center: [f32; 3],
@@ -506,6 +508,7 @@ fn compile_step_assembly(
         });
         let (bounding_center, bounding_radius) = bounding_sphere(&vertices, &local_bounds);
         geometries.push(Geometry {
+            surface_normals: Some(definition.surface_normals),
             vertices,
             source_attributes,
             indices,
@@ -616,6 +619,7 @@ fn compile_triangle_mesh(
     // hundreds of megabytes — to fill a field nothing read.
     let (bounding_center, bounding_radius) = bounding_sphere(&mesh.vertices, &local_bounds);
     let geometry = Geometry {
+        surface_normals: None,
         vertices: mesh.vertices,
         source_attributes,
         indices: mesh.indices,
@@ -935,6 +939,7 @@ fn compile_glb_internal(
             } else {
                 let index = geometries.len();
                 geometries.push(Geometry {
+                    surface_normals: None,
                     vertices,
                     source_attributes,
                     indices,

@@ -182,6 +182,8 @@ pub struct AssemblyDefinition {
     /// Empty when the source leaf has no surviving geometry; the scene carries
     /// a structure error while retaining its occurrences and placements.
     pub soup: StepTriangleSoup,
+    /// Evaluator normals aligned with the unwelded soup vertices.
+    pub surface_normals: Vec<[f32; 3]>,
 }
 
 /// One source occurrence: which definition to render and where in world space.
@@ -1056,6 +1058,7 @@ fn tessellate_definitions(
         let mut positions = Vec::new();
         let mut indices = Vec::new();
         let mut colors = Vec::new();
+        let mut surface_normals = Vec::new();
         for mesh in ids.iter().filter_map(|shell_id| meshed.get(shell_id)) {
             match mesh {
                 Ok(mesh) => {
@@ -1066,6 +1069,16 @@ fn tessellate_definitions(
                             .and_then(|id| face_appearances.get(&id))
                             .map(|appearance| appearance.color)
                             .unwrap_or([1.0; 4]);
+                        for triangle in polygon.tri_faces() {
+                            for vertex in triangle {
+                                let normal = vertex
+                                    .nor
+                                    .and_then(|index| polygon.normals().get(index))
+                                    .map(|n| [n.x as f32, n.y as f32, n.z as f32])
+                                    .unwrap_or([0.0; 3]);
+                                surface_normals.push(normal);
+                            }
+                        }
                         append_polygon(polygon, color, &mut positions, &mut indices, &mut colors);
                     }
                     faces.declared += mesh.tally.declared;
@@ -1100,6 +1113,7 @@ fn tessellate_definitions(
         definition_of_node.insert(node_indices[definition_index], definitions.len());
         definitions.push(AssemblyDefinition {
             node_name: node_names[definition_index].clone(),
+            surface_normals,
             soup: (positions, indices, colors),
         });
     }

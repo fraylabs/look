@@ -648,6 +648,7 @@ mod tests {
     #[test]
     fn test_generate_html_viewer_embedding() {
         let geom = Geometry {
+            surface_normals: None,
             vertices: vec![
                 Vertex {
                     position: [0.0, 0.0, 0.0],
