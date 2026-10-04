@@ -983,6 +983,7 @@ pub fn failure_stage_for_reason(reason: TessellationFailureReason) -> FailureSta
         | R::DegenerateConstraintChain => FailureStage::ConstraintInsertion,
         R::NoOddParityRegion | R::NoFiniteTrianglesAfterParity => FailureStage::MaterialSelection,
         R::NonFinitePosition => FailureStage::SurfaceEvaluation,
+        R::KernelPanicked => FailureStage::Other,
     }
 }
 

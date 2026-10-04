@@ -1728,7 +1728,7 @@ where
         .source_geometric_uncertainty
         .filter(|uncertainty| uncertainty.is_finite() && *uncertainty > 0.0)
         .unwrap_or(source_edge::SOURCE_INCIDENCE_TOLERANCE);
-    let tessellate_edge = |edge: &CompressedEdge<C>| {
+    let tessellate_edge_impl = |edge: &CompressedEdge<C>| {
         let curve = &edge.curve;
         let range = curve.range_tuple();
         if edge_probe {
@@ -1861,6 +1861,13 @@ where
             curve: poly,
         })
     };
+    let tessellate_edge = |edge: &CompressedEdge<C>| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tessellate_edge_impl(edge)))
+            .unwrap_or(EstablishedEdge::Unresolved {
+                vertices: edge.vertices,
+                reason: "edge_tessellation_panicked",
+            })
+    };
     #[cfg(not(target_arch = "wasm32"))]
     let edges: Vec<EstablishedEdge> = shell.edges.par_iter().map(tessellate_edge).collect();
     #[cfg(target_arch = "wasm32")]
@@ -1936,7 +1943,7 @@ where
             );
         }
     }
-    let tessellate_face = |(declared_face_index, face): (usize, &CompressedFace<S>)| {
+    let tessellate_face_impl = |(declared_face_index, face): (usize, &CompressedFace<S>)| {
         let source_face_id = face.provenance.best_id().map(SourceEntityId::get);
         let source_use_id = face.provenance.use_id.map(SourceEntityId::get);
         let periodic_rank = u8::from(face.surface.u_period().is_some())
@@ -2753,6 +2760,54 @@ where
             cone_band_attempt,
             torus_band_attempt,
         )
+    };
+    // Geometry kernels can still assert in evaluators and triangulation.
+    // Refuse only the affected face, retaining its identity and its neighbors.
+    let tessellate_face = |input: (usize, &CompressedFace<S>)| match std::panic::catch_unwind(
+        std::panic::AssertUnwindSafe(|| tessellate_face_impl(input)),
+    ) {
+        Ok(result) => result,
+        Err(_) => {
+            let (_, face) = input;
+            PROBE_FACE_CONTEXT.with(|context| context.set((None, usize::MAX, 0)));
+            diagnosis::begin_face(
+                diagnosis::document_context(),
+                face.provenance.best_id().map(SourceEntityId::get),
+                face.provenance.use_id.map(SourceEntityId::get),
+                diagnosis::PeriodicAxes { u: false, v: false },
+                face.boundaries.len(),
+                face.boundaries.iter().map(Vec::len).sum(),
+                0,
+                0,
+                tol,
+                false,
+                shell.source_geometric_uncertainty,
+            );
+            let failure = diagnosis::fail(
+                TessellationFailureReason::KernelPanicked,
+                diagnosis::FailureStage::Other,
+            );
+            let (failure, record) = if diagnosis::diag_enabled() {
+                let failure = diagnosis::finalize_and_emit(failure);
+                let record = failure.diagnostic.clone();
+                (failure, Some(record))
+            } else {
+                (failure, None)
+            };
+            (
+                CompressedFace {
+                    boundaries: face.boundaries.clone(),
+                    orientation: face.orientation,
+                    surface: None,
+                    provenance: face.provenance,
+                },
+                Some(failure),
+                record,
+                None,
+                None,
+                None,
+            )
+        }
     };
     #[cfg(not(target_arch = "wasm32"))]
     let results: Vec<_> = shell
@@ -9541,6 +9596,8 @@ fn spans_original_endpoints(
 /// opposite of what a typed outcome is for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 pub enum TessellationFailureReason {
+    /// A geometry evaluator or tessellation routine panicked on this face.
+    KernelPanicked,
     /// No lifted boundary could be built, for a reason the lift does not name.
     ///
     /// Retained as the residual bucket now that the lift reports its own
