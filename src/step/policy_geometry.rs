@@ -726,8 +726,8 @@ pub fn wrap_shell(
 }
 
 /// As [`wrap_shell`], additionally attaching each face's source-declared
-/// spline-axis closure, keyed by the STEP surface entity id its provenance
-/// names (`face.provenance.surface_id`).
+/// spline-axis closure, keyed by the STEP face definition or surface entity
+/// id its provenance names. Face entries account for converted parameter axes.
 ///
 /// The closure map is built by the composition layer from the STEP table
 /// ([`crate::step::lattice::spline_closure_map`]); this wrapper only carries the
@@ -758,8 +758,13 @@ pub fn wrap_shell_with_closure(
             .map(|(f, face)| {
                 let closure = face
                     .provenance
-                    .surface_id
-                    .and_then(|id| closure_map.get(&id.get()).copied());
+                    .definition_id
+                    .and_then(|id| closure_map.get(&id.get()).copied())
+                    .or_else(|| {
+                        face.provenance
+                            .surface_id
+                            .and_then(|id| closure_map.get(&id.get()).copied())
+                    });
                 CompressedFace {
                     boundaries: face.boundaries,
                     orientation: face.orientation,

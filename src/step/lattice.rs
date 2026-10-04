@@ -47,7 +47,7 @@ impl SplineAxisClosure {
 }
 
 /// Read the source-declared spline-axis closure of every spline surface entity
-/// a STEP table holds, keyed by surface entity id.
+/// a STEP table holds, keyed by surface entity id and by face definition id.
 ///
 /// This is the provenance seam: the composition layer still holds the raw STEP
 /// table (`b_spline_surface_with_knots`, `uniform_surface`,
@@ -55,9 +55,9 @@ impl SplineAxisClosure {
 /// `u_closed`/`v_closed` declaration is nameable here and nowhere downstream.
 /// The converted `Surface` value the tessellator sees has erased it.
 ///
-/// A `FaceProvenance.surface_id` (truck-topology) names the same entity id, so
-/// the composition layer can attach the closure to each face's surface by that
-/// id before the tessellator's lattice callback runs.
+/// Face entries follow the converter's parameter inversion: reversing a
+/// spline surface transposes its U/V axes. Surface entries retain the source
+/// declaration; face entries describe the converted evaluator's axes.
 pub fn spline_closure_map(
     table: &truck_stepio::r#in::Table,
 ) -> std::collections::HashMap<u64, SplineAxisClosure> {
@@ -104,6 +104,21 @@ pub fn spline_closure_map(
         {
             read(id, owned.u_closed(), owned.v_closed());
         }
+    }
+    use truck_stepio::r#in::ruststep::{ast::Name, tables::PlaceHolder};
+    for (&face_id, face) in &table.face_surface {
+        let PlaceHolder::Ref(Name::Entity(surface_id)) = &face.face_geometry else {
+            continue;
+        };
+        let Some(mut closure) = closures.get(surface_id).copied() else {
+            continue;
+        };
+        // Keep this aligned with truck-stepio's surface.invert() in the
+        // face converter, including its explicit diagnostic opt-out.
+        if !face.same_sense && std::env::var_os("TRUCK_NO_INVERT").is_none() {
+            std::mem::swap(&mut closure.u_closed, &mut closure.v_closed);
+        }
+        closures.insert(face_id, closure);
     }
     closures
 }
@@ -869,6 +884,63 @@ mod source_closure_tests {
     use super::*;
     use truck_geometry::prelude::{BSplineSurface, KnotVec, Point3};
     use truck_meshalgo::tessellation::domain::lattice::AxisPeriodStatus;
+
+    #[test]
+    fn spline_closure_follows_face_parameter_inversion() {
+        let table = truck_stepio::r#in::Table::from_step(
+            "ISO-10303-21; HEADER;
+            FILE_DESCRIPTION(('synthetic closure metadata'),'2;1');
+            FILE_NAME('closure.step','2026-10-04',(''),(''),'','','');
+            FILE_SCHEMA(('AUTOMOTIVE_DESIGN'));
+            ENDSEC; DATA;
+            #1=CARTESIAN_POINT('',(0.,0.,0.));
+            #2=CARTESIAN_POINT('',(1.,0.,0.));
+            #3=CARTESIAN_POINT('',(0.,1.,0.));
+            #4=CARTESIAN_POINT('',(1.,1.,0.));
+            #10=B_SPLINE_SURFACE_WITH_KNOTS('',1,1,((#1,#2),(#3,#4)),
+                .UNSPECIFIED.,.F.,.T.,.F.,(2,2),(2,2),(0.,1.),(0.,1.),.UNSPECIFIED.);
+            #11=ADVANCED_FACE('',(),#10,.F.);
+            #12=ADVANCED_FACE('',(),#10,.T.);
+            ENDSEC; END-ISO-10303-21;",
+        )
+        .unwrap();
+        let map = spline_closure_map(&table);
+        let source = SplineAxisClosure {
+            u_closed: false,
+            v_closed: true,
+        };
+        assert_eq!(map.get(&10), Some(&source));
+        assert_eq!(map.get(&12), Some(&source));
+        assert_eq!(
+            map.get(&11),
+            Some(&SplineAxisClosure {
+                u_closed: true,
+                v_closed: false
+            })
+        );
+        // Check the declaration against a real converted evaluator as well:
+        // the converter transposes the closed V axis when it reverses a face.
+        use truck_meshalgo::prelude::{InnerSpace, Invertible, ParametricSurface};
+        let original = closed_v_spline();
+        let mut inverted = original.clone();
+        inverted.invert();
+        let closure = map[&11];
+        let lattice = lattice_of_with_closure(&inverted, Some(closure));
+        assert!(matches!(
+            lattice.u,
+            AxisPeriodStatus::Exact { period: 1.0, .. }
+        ));
+        assert!(matches!(lattice.v, AxisPeriodStatus::NonPeriodic));
+        let wrapped = crate::step::policy_geometry::PolicySurface::with_closure(
+            inverted,
+            crate::step::meshing_policy::MeshingPolicy::DEFAULT,
+            false,
+            Some(closure),
+        );
+        for u in [-1.75, 0.25, 2.25] {
+            assert!((wrapped.subs(u, 0.4) - original.subs(0.4, 0.25)).magnitude() < 1e-12);
+        }
+    }
 
     /// A degree-2 clamped spline over `[0,1]²` whose `v` direction is a
     /// genuinely closed strip: the last control row equals the first, and the
