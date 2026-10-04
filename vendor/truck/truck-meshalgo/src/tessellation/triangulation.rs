@@ -1624,8 +1624,6 @@ enum EstablishedEdge {
     },
 }
 
-/// The one tessellation body every entry point above funnels into.
-#[allow(clippy::too_many_arguments)]
 /// Source trim chords can cross even when their exact planar BREP curves do
 /// not. Locate only proper source/source crossings; synthetic wire joins and
 /// tangent or coincident traversals have no authority to request refinement.
@@ -1703,6 +1701,8 @@ fn crossed_planar_source_edges<C, S>(
     crossed
 }
 
+/// The one tessellation body every entry point above funnels into.
+#[allow(clippy::too_many_arguments)]
 fn cshell_tessellation_inner<'a, C, S>(
     shell: &CompressedShell<Point3, C, S>,
     tol: f64,
@@ -4986,8 +4986,7 @@ impl PolyBoundaryPiece {
         }
         let mut vec: Vec<SurfacePoint> = Vec::with_capacity(bdry3d.len());
         // The source use each lifted point belongs to, parallel to `vec`. A
-        // lift-refinement midpoint inherits the parent sample's source; the
-        // degenerate-periodic reconstruction clears every entry. Only the
+        // lift-refinement midpoint inherits the parent sample's source. Only the
         // final segment provenance is derived from this; the tags themselves
         // are not retained.
         let mut lifted_tags: Vec<Option<SourceEdgeUse>> = Vec::with_capacity(bdry3d.len());
@@ -5575,42 +5574,6 @@ impl PolyBoundaryPiece {
                 periodic_candidate_count: None,
             });
             return Err(TessellationFailureReason::BoundaryProjectionFailed);
-        }
-        if (bdry3d.len() <= 2 || bdry3d[0].distance(bdry3d[bdry3d.len() - 1]) < 1e-4)
-            && piece_lengths.iter().all(|&l| l <= 2)
-        {
-            if let Some(up) = lattice.declared_u_period() {
-                let p0 = bdry3d[0];
-                if let Some((u0, v0)) = sp(surface, p0, None) {
-                    let mut dense = Vec::new();
-                    const STEPS: usize = 16;
-                    for i in 0..=STEPS {
-                        let frac = i as f64 / STEPS as f64;
-                        let u = u0 + frac * up;
-                        let pt = surface.subs(u, v0);
-                        dense.push((Point2::new(u, v0), pt).into());
-                    }
-                    vec = dense;
-                    // The reconstruction's samples are synthesized from the
-                    // surface, not lifted from source trim: no source edge use
-                    // describes them, so every provenance tag is cleared.
-                    lifted_tags = vec![None; vec.len()];
-                }
-            } else if let Some(vp) = lattice.declared_v_period() {
-                let p0 = bdry3d[0];
-                if let Some((u0, v0)) = sp(surface, p0, None) {
-                    let mut dense = Vec::new();
-                    const STEPS: usize = 16;
-                    for i in 0..=STEPS {
-                        let frac = i as f64 / STEPS as f64;
-                        let v = v0 + frac * vp;
-                        let pt = surface.subs(u0, v);
-                        dense.push((Point2::new(u0, v), pt).into());
-                    }
-                    vec = dense;
-                    lifted_tags = vec![None; vec.len()];
-                }
-            }
         }
         let grav = vec.iter().fold(Point2::origin(), |g, p| g + p.uv.to_vec()) / vec.len() as f64;
         let mut quot_u = 0.0;
@@ -17707,6 +17670,69 @@ mod shared_sample_conformity_tests {
     use super::*;
     use std::f64::consts::PI;
     use truck_geometry::prelude::{Cylinder, Line, Plane, RevolutedCurve};
+
+    #[test]
+    fn short_periodic_strip_preserves_its_source_wire() {
+        let cylinder = Cylinder::new(Point3::origin(), 1.0)
+            .expect("valid cylinder radius")
+            .value;
+        let corners = [
+            Point2::new(0.0, 0.0),
+            Point2::new(0.02, 0.0),
+            Point2::new(0.02, 1.0),
+            Point2::new(0.0, 1.0),
+        ];
+        let points: Vec<Point3> = corners.iter().map(|uv| cylinder.subs(uv.x, uv.y)).collect();
+        let wire = (0..4).map(|index| SourcePolyline {
+            curve: PolylineCurve::from(vec![points[index], points[(index + 1) % 4]]),
+            source: SourceEdgeUse {
+                bound: BoundId(0),
+                index,
+                orientation: true,
+            },
+        });
+        let lattice = CertifiedLattice::revolution(Axis::U, AxisPeriodStatus::NonPeriodic);
+        let piece =
+            PolyBoundaryPiece::try_new(&cylinder, wire, by_search_nearest_parameter, 0.1, &lattice)
+                .expect("a narrow cylinder strip lifts"); // H-1: test fixture
+        assert_eq!(
+            piece.0.len(),
+            5,
+            "a closed four-edge source wire is not a full orbit"
+        );
+        for (sample, &point) in piece.0.iter().zip(points.iter().cycle()) {
+            assert_eq!(
+                sample.point, point,
+                "source trim samples survive without reconstruction"
+            );
+        }
+        let umin = piece
+            .0
+            .iter()
+            .map(|sample| sample.uv.x)
+            .fold(f64::INFINITY, f64::min);
+        let umax = piece
+            .0
+            .iter()
+            .map(|sample| sample.uv.x)
+            .fold(f64::NEG_INFINITY, f64::max);
+        assert!(
+            umax - umin <= 0.020001,
+            "the strip must not expand to an entire period"
+        );
+        assert!(
+            piece.1.iter().all(|sources| !sources.is_empty()),
+            "source edge provenance must survive"
+        );
+        let boundary = PolyBoundary::new(vec![piece], &cylinder, 0.1, &lattice);
+        let mesh = trimming_tessellation_result(&cylinder, &boundary, 0.1, &lattice)
+            .expect("the narrow source strip meshes"); // H-1: test fixture
+        assert!(!mesh.faces().is_empty());
+        assert!(
+            mesh.positions().iter().all(|point| point.x > 0.999),
+            "the mesh stays within the source strip"
+        );
+    }
 
     #[test]
     fn thin_phase_offset_annulus_shares_refined_trim_samples() {
