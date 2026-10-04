@@ -322,3 +322,24 @@ fn step_colours_do_not_change_the_geometry() {
         "triangle count must not change with appearance"
     );
 }
+
+#[test]
+fn compiled_scene_preserves_declared_and_lost_step_faces() {
+    let bytes = std::fs::read(fixture("bracket.step")).unwrap();
+    let source = String::from_utf8(bytes).unwrap();
+    let declared = source.matches("ADVANCED_FACE(").count();
+    // A bad extra source shell cannot silently disappear from the census.
+    let extra = "#900001=PLANE('',#900002);\n#900003=ADVANCED_FACE('',(),#900001,.T.);\n#900004=OPEN_SHELL('',(#900003));\n";
+    let modified = source.replacen(
+        "ENDSEC;\nEND-ISO-10303-21;",
+        &format!("{extra}ENDSEC;\nEND-ISO-10303-21;"),
+        1,
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("incomplete.step");
+    std::fs::write(&path, modified).unwrap();
+    let scene = compile_scene(&path, UpAxis::Z, &mut Timings::default()).unwrap();
+    let stats = scene.statistics.step_import.expect("STEP census");
+    assert_eq!(stats.declared_faces, declared + 1);
+    assert_eq!(stats.lost_faces, 1);
+}

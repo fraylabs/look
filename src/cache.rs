@@ -153,6 +153,7 @@ mod tests {
         fs::write(&source, b"first").unwrap();
         let cache = MetadataCache::at(directory.path().join("cache"));
         let statistics = SceneStatistics {
+            step_import: None,
             nodes: 1,
             mesh_primitives: 1,
             unique_geometries: 1,

@@ -713,6 +713,7 @@ mod tests {
             },
             fit_radius: 1.0,
             statistics: SceneStatistics {
+                step_import: None,
                 nodes: 1,
                 mesh_primitives: 1,
                 unique_geometries: 1,

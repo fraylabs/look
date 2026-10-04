@@ -244,6 +244,8 @@ impl Bounds {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SceneStatistics {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_import: Option<crate::step::StepImportStats>,
     pub nodes: u64,
     pub mesh_primitives: u64,
     pub unique_geometries: u64,
@@ -373,11 +375,11 @@ fn compile_step(
     truck_meshalgo::tessellation::diagnosis::set_document_context(Some(
         path.to_string_lossy().into_owned(),
     ));
-    let scene = crate::step::parse_step_scene(&bytes, timings)
+    let (scene, import_stats) = crate::step::parse_step_scene_with_stats(&bytes, timings)
         .with_context(|| format!("failed to load STEP scene '{}'", path.display()))?;
     timings.record("parse", parse_started.elapsed());
 
-    match scene {
+    let mut compiled = match scene {
         crate::step::StepScene::Flat((positions, indices, colors)) => compile_step_flat(
             path,
             positions,
@@ -410,7 +412,9 @@ fn compile_step(
             include_source_materials,
             timings,
         ),
-    }
+    }?;
+    compiled.statistics.step_import = Some(import_stats);
+    Ok(compiled)
 }
 
 /// The single-part STEP compile tail: one geometry, one instance, unchanged.
@@ -556,6 +560,7 @@ fn compile_step_assembly(
         bounds,
         fit_radius,
         statistics: SceneStatistics {
+            step_import: None,
             nodes: scene.nodes as u64,
             mesh_primitives: instance_count,
             unique_geometries: geometry_count,
@@ -651,6 +656,7 @@ fn compile_triangle_mesh(
         bounds,
         fit_radius,
         statistics: SceneStatistics {
+            step_import: None,
             nodes: 1,
             mesh_primitives: 1,
             unique_geometries: 1,
@@ -986,6 +992,7 @@ fn compile_glb_internal(
         .map(|geometry| geometry.vertices.len() as u64)
         .sum();
     let statistics = SceneStatistics {
+        step_import: None,
         nodes: node_count,
         mesh_primitives: source_primitives,
         unique_geometries: geometries.len() as u64,

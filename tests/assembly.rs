@@ -419,3 +419,13 @@ fn empty_leaf_does_not_poison_compiled_scene_bounds() {
             .any(|reason| reason.contains("partC"))
     );
 }
+
+#[test]
+fn face_census_counts_definitions_once_instead_of_occurrences() {
+    let (_, stats) =
+        look::step::parse_step_scene_with_stats(FIXTURE.as_bytes(), &mut Timings::default())
+            .unwrap();
+    // Three definition nodes share one source triangle shell; five occurrences.
+    assert_eq!(stats.declared_faces, 1);
+    assert_eq!(stats.lost_faces, 0);
+}
