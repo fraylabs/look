@@ -26,3 +26,24 @@ fn sp_negative_test() {
     let q = Point2::new(-1.0, 0.0);
     assert!(curve.search_parameter(q, None, 0).is_none());
 }
+
+// Normalized endpoints from FreeCAD hyperbola #6174 in the real STEP
+// face-loss repro. Quartic roots are sinh(t), not curve parameters.
+#[test]
+fn nearest_parameter_on_negative_branch_step_endpoints() {
+    let curve = UnitHyperbola::<Point2>::new();
+    for t in [-2.761967, -2.742247, 2.761967, 2.742247] {
+        let point = curve.subs(t);
+        let nearest = curve.search_nearest_parameter(point, None, 0).unwrap();
+        assert!((nearest - t).abs() < 1.0e-8, "expected {t}, got {nearest}");
+        assert!(point.distance(curve.subs(nearest)) < 1.0e-7);
+    }
+}
+
+#[test]
+fn nearest_parameter_refuses_nonfinite_points() {
+    let curve = UnitHyperbola::<Point2>::new();
+    for point in [Point2::new(f64::NAN, 0.0), Point2::new(1.0, f64::INFINITY)] {
+        assert!(curve.search_nearest_parameter(point, None, 0).is_none());
+    }
+}

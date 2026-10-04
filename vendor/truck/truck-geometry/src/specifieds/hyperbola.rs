@@ -75,24 +75,27 @@ impl SearchNearestParameter<D1> for UnitHyperbola<Point2> {
         _: H,
         _: usize,
     ) -> Option<f64> {
+        if !p.x.is_finite() || !p.y.is_finite() {
+            return None;
+        }
         let ctx = ToleranceCtx::unscaled_legacy();
         let a = -p.y;
         let b = (p.y * p.y - p.x * p.x) / 4.0 + 1.0;
         let c = -p.y;
         let d = p.y * p.y / 4.0;
-        let y = solver::solve_quartic(a, b, c, d)
+        // The quartic is in y = sinh(t); rank points after converting to t.
+        let t = solver::solve_quartic(a, b, c, d)
             .into_iter()
             .filter_map(|z| match ctx.is_small_ratio(z.im) {
                 // BG-TOL-001: param
-                true => Some(z.re),
-                false => None,
+                true if z.re.is_finite() => Some(z.re.asinh()),
+                _ => None,
             })
             .min_by(|s, t| {
                 p.distance2(self.subs(*s))
-                    .partial_cmp(&p.distance2(self.subs(*t)))
-                    .unwrap()
+                    .total_cmp(&p.distance2(self.subs(*t)))
             })?;
-        Some(f64::asinh(y))
+        Some(t)
     }
 }
 
