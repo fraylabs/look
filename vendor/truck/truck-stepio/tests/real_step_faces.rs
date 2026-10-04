@@ -1,3 +1,4 @@
+// Source licences for embedded real-model STEP data: real_step_faces.NOTICE.md.
 use truck_stepio::r#in::{convert::FaceLossReason, Table};
 
 fn table(data: &str) -> Table {

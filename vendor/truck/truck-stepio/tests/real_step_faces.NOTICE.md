@@ -1,0 +1,8 @@
+# STEP regression data provenance
+
+The Rust tests are MIT OR Apache-2.0. The following inline STEP data blocks retain their source model licences; they are test inputs and are not linked into the Look or Burr production executable.
+
+- `freecad_hyperbola_face_survives_conversion`: reduced face #11360 and dependencies from Thomas H. F. Wright's [Apollo enclosure flat assembly](https://github.com/ThomasHFWright/apollo-3d-enclosure/blob/4af5920f049f254a225d7978a1970bb156209904/output/flat/assembly.step), revision `4af5920f049f254a225d7978a1970bb156209904`. Source licence: CC-BY-NC-SA-4.0, reproduced in [notices/apollo-LICENSE.md](notices/apollo-LICENSE.md). Reduction keeps source entity IDs and coordinates; extraneous faces and entities were removed on 2026-10-04.
+- `voron2_small_cylinder_retains_distinct_line_carriers`: reduced face #1749736 and dependencies from [Voron Design's Voron 2.4r2 assembly](https://github.com/VoronDesign/Voron-2/blob/a192410e27ea345644ae5c4b29b4c9c40cbe1a73/CAD/Voron_2.4r2_Assembly_STEP.zip), revision `a192410e27ea345644ae5c4b29b4c9c40cbe1a73`. Source licence: GPL-3.0, reproduced in [notices/GPL-3.0.txt](notices/GPL-3.0.txt). Reduction keeps source entity IDs and coordinates; other entities were removed and a synthetic OPEN_SHELL wrapper was added on 2026-10-04.
+
+All other data blocks in this file are synthetic mathematical regressions authored for these tests. The nullable assembly graph in `input/fixtures/` is also synthetic and contains no Voron geometry. Original downloaded CAD and Burr corpus reductions remain external, separately licensed measurement inputs; no such model is copied into Burr's MIT test suite by this integration.
