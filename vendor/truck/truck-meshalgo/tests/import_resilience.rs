@@ -50,8 +50,17 @@ fn approximate_vertices_do_not_deform_the_edge_carrier() {
     shell.source_geometric_uncertainty = Some(0.0001);
     let mesh = shell.triangulation(0.001);
     assert!(mesh.faces[0].surface.is_some());
-    assert_eq!(mesh.edges[0].curve[0], Point3::new(1., 0., 0.));
-    assert_ne!(mesh.edges[0].curve[0], shell.vertices[0]);
+    // Keep the analytic carrier and its interior samples unchanged while
+    // realizing admitted endpoints at the shared source vertices. Otherwise
+    // this edge and its adjacent line leave cracks in a conforming shell.
+    assert_eq!(shell.edges[0].curve.subs(0.), Point3::new(1., 0., 0.));
+    let samples = &mesh.edges[0].curve;
+    assert_eq!(samples.first(), Some(&shell.vertices[0]));
+    assert_eq!(samples.last(), Some(&shell.vertices[1]));
+    assert!(samples.len() > 2);
+    for point in &samples[1..samples.len() - 1] {
+        assert!((point.distance(Point3::origin()) - 1.).abs() < 1e-10);
+    }
 }
 
 #[test]
