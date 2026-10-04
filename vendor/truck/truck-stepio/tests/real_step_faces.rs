@@ -162,7 +162,7 @@ fn one_panicking_surface_does_not_discard_neighboring_faces() {
 }
 
 #[test]
-fn voron2_small_cylinder_retains_distinct_line_carriers() {
+fn voron2_small_cylinder_retains_carriers_and_refuses_off_surface_vertices() {
     use truck_geometry::prelude::*;
     use truck_meshalgo::tessellation::MeshableShape;
     let table = table(
@@ -208,13 +208,17 @@ fn voron2_small_cylinder_retains_distinct_line_carriers() {
     );
     // The original assembly declares 0.01-unit source uncertainty.
     shell.source_geometric_uncertainty = Some(0.01);
+    // Source incidence admits these two distinct line carriers, but their
+    // shared vertices are 0.001464 units off the cylinder. Conforming meshes
+    // must retain the shared vertices; the source uncertainty does not widen
+    // the surface projection's 0.001-unit mesh bound or authorize a new trim.
+    for vertex in &shell.vertices {
+        let surface = &shell.faces[0].surface;
+        let (u, v) = surface.search_nearest_parameter(*vertex, None, 100).unwrap();
+        assert!(surface.subs(u, v).distance(*vertex) > 0.001);
+    }
     let mesh = shell.triangulation(0.001);
-    assert!(!mesh.faces[0]
-        .surface
-        .as_ref()
-        .unwrap()
-        .tri_faces()
-        .is_empty());
+    assert!(mesh.faces[0].surface.is_none());
 }
 
 #[test]
