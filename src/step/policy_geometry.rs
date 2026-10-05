@@ -470,9 +470,6 @@ impl PolicySurface {
             return uv;
         }
         let spans = (u1 - u0, v1 - v0);
-        if !self.inverse_has_regular_jacobian(uv, spans) {
-            return uv;
-        }
         // Keep the original inverse as a locality hint, but start Newton on
         // the native chart. Only the starting guess is projected: the result
         // must independently satisfy the domain and physical residual checks.
@@ -490,9 +487,10 @@ impl PolicySurface {
                 .or_else(|| self.inner.search_nearest_parameter(point, hint, trials));
             if let Some(candidate) = candidate {
                 if self.inverse_is_strictly_native(candidate)
-                    && self.inverse_has_regular_jacobian(candidate, spans)
                     && (self.inner.subs(candidate.0, candidate.1) - point).magnitude()
                         <= residual + truck_meshalgo::prelude::TOLERANCE
+                    && self.inverse_has_regular_jacobian(uv, spans)
+                    && self.inverse_has_regular_jacobian(candidate, spans)
                 {
                     return candidate;
                 }
