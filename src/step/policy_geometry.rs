@@ -426,6 +426,18 @@ impl PolicySurface {
         uv.0 >= u0 && uv.0 <= u1 && uv.1 >= v0 && uv.1 <= v1
     }
 
+    fn inverse_has_regular_jacobian(&self, uv: (f64, f64), spans: (f64, f64)) -> bool {
+        // Normalize derivatives to the native domain, so the rank decision is
+        // invariant to carrier units and independent parameter rescaling.
+        // A nearly collapsed edge has many indistinguishable inverses; choosing
+        // another root there can change trim order without moving its point.
+        let du = self.inner.uder(uv.0, uv.1) * spans.0;
+        let dv = self.inner.vder(uv.0, uv.1) * spans.1;
+        let scale = du.magnitude2() + dv.magnitude2();
+        let area2 = du.cross(dv).magnitude2();
+        scale.is_finite() && area2.is_finite() && area2 > 64.0 * f64::EPSILON * scale * scale
+    }
+
     fn prefer_native_inverse(&self, point: Point3, uv: (f64, f64), trials: usize) -> (f64, f64) {
         if self.u_quotient.is_some()
             || self.v_quotient.is_some()
@@ -457,6 +469,10 @@ impl PolicySurface {
         if ![u0, u1, v0, v1].iter().all(|x| x.is_finite()) || u1 <= u0 || v1 <= v0 {
             return uv;
         }
+        let spans = (u1 - u0, v1 - v0);
+        if !self.inverse_has_regular_jacobian(uv, spans) {
+            return uv;
+        }
         // Keep the original inverse as a locality hint, but start Newton on
         // the native chart. Only the starting guess is projected: the result
         // must independently satisfy the domain and physical residual checks.
@@ -474,6 +490,7 @@ impl PolicySurface {
                 .or_else(|| self.inner.search_nearest_parameter(point, hint, trials));
             if let Some(candidate) = candidate {
                 if self.inverse_is_strictly_native(candidate)
+                    && self.inverse_has_regular_jacobian(candidate, spans)
                     && (self.inner.subs(candidate.0, candidate.1) - point).magnitude()
                         <= residual + truck_meshalgo::prelude::TOLERANCE
                 {
@@ -1167,6 +1184,49 @@ mod quotient_tests {
             .expect("retain the source's exterior inverse when no native root exists");
         assert!(uv.0 > 1.0);
         assert!((wrapped.subs(uv.0, uv.1) - point).magnitude() < 1.0e-6);
+    }
+
+    #[test]
+    fn ordinary_spline_preserves_nearly_collapsed_edge_inverse_representative() {
+        // S(u,v)=(u,u*v,1e-10*(v-0.1*v^3)). At u=0 the edge is
+        // numerically collapsed; distinct v roots cannot select a trim branch
+        // reliably. Its exterior inverse must keep the source representative.
+        let controls = [0.0, 1.0 / 3.0, 2.0 / 3.0, 0.9];
+        for scale in [1.0, 1000.0] {
+            let rows = [0.0, 1.0]
+                .into_iter()
+                .map(|u| {
+                    controls
+                        .iter()
+                        .enumerate()
+                        .map(|(j, z)| {
+                            Point3::new(
+                                scale * u,
+                                scale * u * (j as f64 / 3.0),
+                                scale * 1.0e-10 * z,
+                            )
+                        })
+                        .collect()
+                })
+                .collect();
+            let inner = Surface::BSplineSurface(BSplineSurface::new(
+                (KnotVec::bezier_knot(1), KnotVec::bezier_knot(3)),
+                rows,
+            ));
+            let wrapped = PolicySurface::with_closure(
+                inner,
+                MeshingPolicy::DEFAULT,
+                false,
+                Some(SplineAxisClosure::OPEN),
+            );
+            let source = (0.0, 3.0);
+            let point = wrapped.subs(source.0, source.1);
+            let actual = wrapped.prefer_native_inverse(point, source, 100);
+            assert_eq!(
+                actual, source,
+                "an ambiguous near-pole root must preserve trim continuity"
+            );
+        }
     }
 
     fn v_closed() -> SplineAxisClosure {
