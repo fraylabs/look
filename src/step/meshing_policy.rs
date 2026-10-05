@@ -38,7 +38,7 @@ const TRUCK_MINIMUM_TOLERANCE: f64 = 1.0e-6;
 /// ([`crate::cache::CachedInspection`]) so a rebuild with a new algorithm
 /// revision invalidates stale statistics even when the package version is
 /// unchanged.
-pub const TESSELLATION_ALGORITHM_REVISION: u32 = 10;
+pub const TESSELLATION_ALGORITHM_REVISION: u32 = 11;
 
 /// The Truck revision the build resolves against, as pinned in `Cargo.toml`.
 /// Folded into the cache identity for the same reason as

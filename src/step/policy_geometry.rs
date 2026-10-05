@@ -49,8 +49,8 @@
 use std::collections::{HashMap, HashSet};
 
 use truck_meshalgo::prelude::{
-    BoundedCurve, BoundedSurface, D2, ParameterDivision1D, ParameterDivision2D, ParameterRange,
-    ParametricCurve, ParametricSurface, ParametricSurface3D, Point3, SPHint2D,
+    BoundedCurve, BoundedSurface, D2, InnerSpace, ParameterDivision1D, ParameterDivision2D,
+    ParameterRange, ParametricCurve, ParametricSurface, ParametricSurface3D, Point3, SPHint2D,
     SearchNearestParameter, SearchParameter, Vector3,
 };
 use truck_stepio::r#in::step_geometry::{Conic3D, Curve3D, ElementarySurface, Surface};
@@ -351,6 +351,51 @@ impl PolicySurface {
         )
     }
 
+    fn inverse_is_in_native_domain(&self, uv: (f64, f64)) -> bool {
+        let ((u0, u1), (v0, v1)) = match &self.inner {
+            Surface::BSplineSurface(s) => BoundedSurface::evaluation_range(s),
+            Surface::NurbsSurface(s) => BoundedSurface::evaluation_range(s),
+            _ => return true,
+        };
+        let in_range = |x: f64, a: f64, b: f64| {
+            let margin = (b - a).abs().max(1.0) * 1.0e-6;
+            x >= a - margin && x <= b + margin
+        };
+        (self.u_quotient.is_some() || in_range(uv.0, u0, u1))
+            && (self.v_quotient.is_some() || in_range(uv.1, v0, v1))
+    }
+
+    fn prefer_native_inverse(&self, point: Point3, uv: (f64, f64), trials: usize) -> (f64, f64) {
+        if self.u_quotient.is_some()
+            || self.v_quotient.is_some()
+            || self.inverse_is_in_native_domain(uv)
+        {
+            return uv;
+        }
+        // An exterior Newton root can realize the boundary point while its
+        // extrapolated chart produces unrelated interior geometry. Prefer an
+        // equally accurate native-domain root, without rejecting legacy faces
+        // for which the source admits only an exterior inverse.
+        let residual = (self.inner.subs(uv.0, uv.1) - point).magnitude();
+        let candidates =
+            std::iter::once(None).chain(self.inner.search_parameter_seeds().into_iter().map(Some));
+        for hint in candidates {
+            let candidate = self
+                .inner
+                .search_parameter(point, hint, trials)
+                .or_else(|| self.inner.search_nearest_parameter(point, hint, trials));
+            if let Some(candidate) = candidate {
+                if self.inverse_is_in_native_domain(candidate)
+                    && (self.inner.subs(candidate.0, candidate.1) - point).magnitude()
+                        <= residual + truck_meshalgo::prelude::TOLERANCE
+                {
+                    return candidate;
+                }
+            }
+        }
+        uv
+    }
+
     /// Whether a final parameter-inverse result is a valid representative.
     ///
     /// The strict final-range rule exists to keep a *source-certified periodic
@@ -617,9 +662,11 @@ impl SearchParameter<D2> for PolicySurface {
         // axis (e.g. `u = 3.63` for a true `u = 0.765` on `[0,1]`). Rejecting the
         // final result here lets the existing fallback chain (hintless /
         // structural seeds) find the in-domain root; it never clamps an exterior
-        // value onto the boundary. Ordinary splines with no certified quotient
-        // pass straight through (`accept_inverse_result` applies no bound).
+        // value onto the boundary. For an ordinary spline, prefer an equally
+        // accurate native root before retaining the legacy result
+        // (`accept_inverse_result` applies no bound).
         let uv = self.inner.search_parameter(point, hint, trials)?;
+        let uv = self.prefer_native_inverse(point, uv, trials);
         self.accept_inverse_result(uv).then_some(uv)
     }
     // Forward the structure-derived seeds (e.g. a B-spline's knot-span starts)
@@ -643,6 +690,7 @@ impl SearchNearestParameter<D2> for PolicySurface {
         trials: usize,
     ) -> Option<(f64, f64)> {
         let uv = self.inner.search_nearest_parameter(point, hint, trials)?;
+        let uv = self.prefer_native_inverse(point, uv, trials);
         self.accept_inverse_result(uv).then_some(uv)
     }
 }
@@ -983,6 +1031,54 @@ mod quotient_tests {
             column(0.7, 1.5),
         ];
         Surface::BSplineSurface(BSplineSurface::new(knots, control_points))
+    }
+
+    #[test]
+    fn ordinary_spline_inverse_prefers_native_root_over_extrapolated_root() {
+        // x(u) = u - 0.1*u^3 is regular on [0,1], but its extrapolation
+        // returns to the same point beyond u=3. The hint must not turn that
+        // exterior root into a chart spanning the extrapolated carrier.
+        let knots = (KnotVec::bezier_knot(3), KnotVec::bezier_knot(1));
+        let controls = [0.0, 1.0 / 3.0, 2.0 / 3.0, 0.9]
+            .into_iter()
+            .map(|x| vec![Point3::new(x, 0.0, 0.0), Point3::new(x, 1.0, 0.0)])
+            .collect();
+        let inner = Surface::BSplineSurface(BSplineSurface::new(knots, controls));
+        let point = inner.subs(0.25, 0.5);
+        let wrapped = PolicySurface::with_closure(
+            inner,
+            MeshingPolicy::DEFAULT,
+            false,
+            Some(SplineAxisClosure::OPEN),
+        );
+        let uv = wrapped
+            .search_parameter(point, (3.0, 0.5), 100)
+            .expect("an in-domain root exists");
+        assert!((0.0..=1.0).contains(&uv.0), "escaped native domain: {uv:?}");
+        assert!((wrapped.subs(uv.0, uv.1) - point).magnitude() < 1.0e-6);
+    }
+
+    #[test]
+    fn ordinary_spline_preserves_exterior_inverse_when_no_native_root_exists() {
+        let knots = (KnotVec::bezier_knot(3), KnotVec::bezier_knot(1));
+        let controls = [0.0, 1.0 / 3.0, 2.0 / 3.0, 0.9]
+            .into_iter()
+            .map(|x| vec![Point3::new(x, 0.0, 0.0), Point3::new(x, 1.0, 0.0)])
+            .collect();
+        let inner = Surface::BSplineSurface(BSplineSurface::new(knots, controls));
+        // This point lies beyond the native patch's x<=0.9 control hull.
+        let point = inner.subs(2.0, 0.5);
+        let wrapped = PolicySurface::with_closure(
+            inner,
+            MeshingPolicy::DEFAULT,
+            false,
+            Some(SplineAxisClosure::OPEN),
+        );
+        let uv = wrapped
+            .search_parameter(point, (2.0, 0.5), 100)
+            .expect("retain the source's exterior inverse when no native root exists");
+        assert!(uv.0 > 1.0);
+        assert!((wrapped.subs(uv.0, uv.1) - point).magnitude() < 1.0e-6);
     }
 
     fn v_closed() -> SplineAxisClosure {
