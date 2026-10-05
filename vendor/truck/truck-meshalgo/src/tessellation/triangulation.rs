@@ -4744,6 +4744,70 @@ impl From<(Point2, Point3)> for SurfacePoint {
     }
 }
 
+/// Resolve a single cone-apex half-turn from the complete ordered source arc.
+/// Only a unique closed half-chart is eligible. Full-turn cones, arbitrary
+/// spline singularities and multiple apex half-turns keep their old lift.
+fn reconcile_cone_half_chart(
+    points: &mut Vec<SurfacePoint>,
+    tags: &mut Vec<Option<SourceEdgeUse>>,
+    lattice: &CertifiedLattice,
+) {
+    let Some((polar, apex)) = lattice.cone_apex else {
+        return;
+    };
+    let (polar_index, angular_index, period) = match polar {
+        Axis::U => (0, 1, lattice.v_generator()),
+        Axis::V => (1, 0, lattice.u_generator()),
+    };
+    let Some(period) = period.filter(|p| p.is_finite() && *p > 0.0) else {
+        return;
+    };
+    if points.len() < 4 || points[0].point.distance(points.last().unwrap().point) > TOLERANCE {
+        return;
+    }
+    let margin = 256.0 * f64::EPSILON * period;
+    let winding = (points.last().unwrap().uv[angular_index] - points[0].uv[angular_index]) / period;
+    if (winding.abs() - 1.0).abs() > 256.0 * f64::EPSILON {
+        return;
+    }
+    let shift = -winding.round() * period;
+    let apex_margin = 256.0 * f64::EPSILON * apex.abs().max(1.0);
+    let transitions: Vec<_> = points
+        .windows(2)
+        .enumerate()
+        .filter_map(|(i, pair)| {
+            let leaves_apex = (pair[0].uv[polar_index] - apex).abs() <= apex_margin
+                && (pair[1].uv[polar_index] - apex).abs() > apex_margin;
+            let jump = (pair[1].uv[angular_index] - pair[0].uv[angular_index]).abs();
+            (leaves_apex && (jump - period * 0.5).abs() <= margin).then_some(i + 1)
+        })
+        .collect();
+    if transitions.len() != 1 {
+        return;
+    }
+    let index = transitions[0];
+    let mut candidate = points.clone();
+    for point in &mut candidate[index..] {
+        point.uv[angular_index] += shift;
+    }
+    let (lo, hi) = candidate
+        .iter()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), p| {
+            (lo.min(p.uv[angular_index]), hi.max(p.uv[angular_index]))
+        });
+    if hi - lo > period * 0.5 + margin {
+        return;
+    }
+    // The two representatives at the certified apex have the same world point.
+    // The bridge has no source-edge contributor; every original tag is retained.
+    let mut bridge = candidate[index - 1];
+    bridge.uv[angular_index] = candidate[index].uv[angular_index];
+    candidate.insert(index, bridge);
+    let source = tags[index - 1].take();
+    tags.insert(index, source);
+    *points = candidate;
+}
+
 /// Reconciles a UV step entering or leaving a detected collapsed direction.
 ///
 /// A small derivative only proposes a chart substitution. The candidate UV
@@ -5613,6 +5677,7 @@ impl PolyBoundaryPiece {
             });
             return Err(TessellationFailureReason::BoundaryProjectionFailed);
         }
+        reconcile_cone_half_chart(&mut vec, &mut lifted_tags, lattice);
         let grav = vec.iter().fold(Point2::origin(), |g, p| g + p.uv.to_vec()) / vec.len() as f64;
         let mut quot_u = 0.0;
         let mut quot_v = 0.0;
@@ -17786,6 +17851,244 @@ mod shared_sample_conformity_tests {
         ) -> (Vec<f64>, Vec<f64>) {
             (vec![u0, (u0 + u1) * 0.5, u1], vec![v0, (v0 + v1) * 0.5, v1])
         }
+    }
+
+    /// Exact inverse separates the chart transition from numerical cone inversion.
+    #[derive(Clone)]
+    struct ExactCone(RevolutedCurve<Line<Point3>>);
+    impl ParametricSurface for ExactCone {
+        type Point = Point3;
+        type Vector = Vector3;
+        fn subs(&self, u: f64, v: f64) -> Point3 {
+            self.0.subs(u, v)
+        }
+        fn uder(&self, u: f64, v: f64) -> Vector3 {
+            self.0.uder(u, v)
+        }
+        fn vder(&self, u: f64, v: f64) -> Vector3 {
+            self.0.vder(u, v)
+        }
+        fn uuder(&self, u: f64, v: f64) -> Vector3 {
+            self.0.uuder(u, v)
+        }
+        fn uvder(&self, u: f64, v: f64) -> Vector3 {
+            self.0.uvder(u, v)
+        }
+        fn vvder(&self, u: f64, v: f64) -> Vector3 {
+            self.0.vvder(u, v)
+        }
+        fn der_mn(&self, m: usize, n: usize, u: f64, v: f64) -> Vector3 {
+            self.0.der_mn(m, n, u, v)
+        }
+        fn v_period(&self) -> Option<f64> {
+            Some(2.0 * PI)
+        }
+    }
+
+    impl ParametricSurface3D for ExactCone {}
+    impl Invertible for ExactCone {
+        fn invert(&mut self) {
+            self.0.invert();
+        }
+        fn inverse(&self) -> Self {
+            Self(self.0.inverse())
+        }
+    }
+    impl ParameterDivision2D for ExactCone {
+        fn parameter_division(
+            &self,
+            range: ((f64, f64), (f64, f64)),
+            tol: f64,
+        ) -> (Vec<f64>, Vec<f64>) {
+            self.0.parameter_division(range, tol)
+        }
+    }
+    impl SearchNearestParameter<D2> for ExactCone {
+        type Point = Point3;
+        fn search_nearest_parameter<H: Into<SPHint2D>>(
+            &self,
+            point: Point3,
+            hint: H,
+            _: usize,
+        ) -> Option<(f64, f64)> {
+            let u = (point.z + 0.2) / 1.4;
+            let v = if point.x.hypot(point.y) < 1e-9 {
+                match hint.into() {
+                    SPHint2D::Parameter(_, v) => v,
+                    _ => 0.0,
+                }
+            } else {
+                point.y.atan2(point.x) * self.0.axis().z
+            };
+            Some((u, v))
+        }
+    }
+    impl SearchParameter<D2> for ExactCone {
+        type Point = Point3;
+        fn search_parameter<H: Into<SPHint2D>>(
+            &self,
+            point: Point3,
+            hint: H,
+            trials: usize,
+        ) -> Option<(f64, f64)> {
+            let uv = self.search_nearest_parameter(point, hint, trials)?;
+            (self.subs(uv.0, uv.1).distance(point) < 1e-6).then_some(uv)
+        }
+    }
+    #[test]
+    fn half_cone_apex_chart_retains_every_source_circle_segment() {
+        let cone = ExactCone(RevolutedCurve::by_revolution(
+            Line(Point3::new(-0.2, 0.0, -0.2), Point3::new(1.2, 0.0, 1.2)),
+            Point3::origin(),
+            Vector3::unit_z(),
+        ));
+        let apex = 1.0 / 7.0;
+        for phase in [-1e-12, -1e-15, 0.0, 1e-15, 1e-12, PI * 0.2, PI * 0.8] {
+            let mut edges = Vec::new();
+            edges.push(
+                (0..=16)
+                    .map(|i| cone.subs(1.0 - (1.0 - apex) * i as f64 / 16.0, -PI + phase))
+                    .collect::<Vec<_>>(),
+            );
+            edges.push(
+                (0..=16)
+                    .map(|i| cone.subs(apex + (1.0 - apex) * i as f64 / 16.0, phase))
+                    .collect::<Vec<_>>(),
+            );
+            edges.push(
+                (0..=16)
+                    .map(|i| cone.subs(1.0, PI * i as f64 / 16.0 + phase))
+                    .collect::<Vec<_>>(),
+            );
+            // Source-edge endpoints are shared exactly, including the arbitrary apex angle.
+            let tip = Point3::origin();
+            edges[0][16] = tip;
+            edges[1][0] = tip;
+            edges[2][0] = edges[1][16];
+            edges[2][16] = edges[0][0];
+            for reversed in [false, true] {
+                for inverted in [false, true] {
+                    let mut edges = edges.clone();
+                    if reversed {
+                        edges.reverse();
+                        for edge in &mut edges {
+                            edge.reverse();
+                        }
+                    }
+                    let mut processed =
+                        truck_geometry::prelude::Processor::<_, Matrix4>::new(cone.clone());
+                    let mut lattice =
+                        CertifiedLattice::revolution(Axis::V, AxisPeriodStatus::NonPeriodic);
+                    lattice.cone_apex = Some((Axis::U, apex));
+                    if inverted {
+                        processed.invert();
+                        lattice = lattice.swapped();
+                    }
+                    let wire = edges
+                        .iter()
+                        .enumerate()
+                        .map(|(index, points)| SourcePolyline {
+                            curve: PolylineCurve::from(points.clone()),
+                            source: SourceEdgeUse {
+                                bound: BoundId(0),
+                                index,
+                                orientation: true,
+                            },
+                        });
+                    let piece = PolyBoundaryPiece::try_new(
+                        &processed,
+                        wire,
+                        by_search_nearest_parameter,
+                        0.02,
+                        &lattice,
+                    )
+                    .expect("a valid half cone lifts");
+                    for (source_index, edge) in edges.iter().enumerate() {
+                        for source in edge.windows(2) {
+                            assert!(
+                                piece.0.windows(2).enumerate().any(|(i, pair)| {
+                                    pair[0].point.distance(source[0]) < 1e-9
+                                        && pair[1].point.distance(source[1]) < 1e-9
+                                        && piece.1[i].iter().any(|tag| tag.index == source_index)
+                                }),
+                                "each physical source segment keeps its contributor"
+                            );
+                        }
+                    }
+                    let boundary = PolyBoundary::new(vec![piece], &processed, 0.02, &lattice);
+                    let mesh = trimming_tessellation_result(&processed, &boundary, 0.02, &lattice)
+                        .expect("a valid half cone tessellates");
+                    for source in edges.iter().flat_map(|edge| edge.windows(2)) {
+                        let present = mesh.tri_faces().iter().any(|tri| {
+                            (0..3).any(|i| {
+                                let a = mesh.positions()[tri[i].pos];
+                                let b = mesh.positions()[tri[(i + 1) % 3].pos];
+                                (a.distance(source[0]) < 1e-9 && b.distance(source[1]) < 1e-9)
+                                    || (b.distance(source[0]) < 1e-9
+                                        && a.distance(source[1]) < 1e-9)
+                            })
+                        });
+                        assert!(present,"every supplied segment must survive phase={phase} reversed={reversed} inverted={inverted}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cone_half_chart_preserves_full_turn_and_uncertified_lifts() {
+        let cone = ExactCone(RevolutedCurve::by_revolution(
+            Line(Point3::new(-0.2, 0.0, -0.2), Point3::new(1.2, 0.0, 1.2)),
+            Point3::origin(),
+            Vector3::unit_z(),
+        ));
+        let apex = 1.0 / 7.0;
+        let mut lattice = CertifiedLattice::revolution(Axis::V, AxisPeriodStatus::NonPeriodic);
+        lattice.cone_apex = Some((Axis::U, apex));
+        let mut points = vec![
+            SurfacePoint::from((Point2::new(1.0, 0.0), cone.subs(1.0, 0.0))),
+            SurfacePoint::from((Point2::new(apex, 0.0), Point3::origin())),
+        ];
+        for i in 0..=16 {
+            let v = 2.0 * PI * i as f64 / 16.0;
+            points.push((Point2::new(1.0, v), cone.subs(1.0, v)).into());
+        }
+        let old = points.clone();
+        let mut tags = vec![None; points.len()];
+        reconcile_cone_half_chart(&mut points, &mut tags, &lattice);
+        assert_eq!(points.len(), old.len());
+        assert!(points
+            .iter()
+            .zip(&old)
+            .all(|(a, b)| a.uv == b.uv && a.point == b.point));
+        // Two apex departures do not select a unique source half-chart.
+        points = vec![
+            (Point2::new(1.0, PI), cone.subs(1.0, PI)).into(),
+            (Point2::new(apex, PI), Point3::origin()).into(),
+            (Point2::new(1.0, 2.0 * PI), cone.subs(1.0, 0.0)).into(),
+            (Point2::new(apex, 2.0 * PI), Point3::origin()).into(),
+            (Point2::new(1.0, 3.0 * PI), cone.subs(1.0, PI)).into(),
+        ];
+        let old = points.clone();
+        let mut tags = vec![None; points.len()];
+        reconcile_cone_half_chart(&mut points, &mut tags, &lattice);
+        assert_eq!(points.len(), old.len());
+        assert!(points
+            .iter()
+            .zip(&old)
+            .all(|(a, b)| a.uv == b.uv && a.point == b.point));
+        // A similar-looking collapsed periodic spline has no cone certificate.
+        points = vec![
+            (Point2::new(1.0, PI), cone.subs(1.0, PI)).into(),
+            (Point2::new(apex, PI), Point3::origin()).into(),
+            (Point2::new(1.0, 2.0 * PI), cone.subs(1.0, 0.0)).into(),
+            (Point2::new(1.0, 3.0 * PI), cone.subs(1.0, PI)).into(),
+        ];
+        let old = points.clone();
+        let mut tags = vec![None; points.len()];
+        lattice.cone_apex = None;
+        reconcile_cone_half_chart(&mut points, &mut tags, &lattice);
+        assert!(points.iter().zip(&old).all(|(a, b)| a.uv == b.uv));
     }
 
     #[test]

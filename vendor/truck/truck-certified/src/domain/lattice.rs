@@ -155,6 +155,10 @@ pub struct CertifiedLattice {
     pub u: AxisPeriodStatus,
     /// The `v` axis.
     pub v: AxisPeriodStatus,
+    /// A concrete conical representation's generatrix parameter at its apex.
+    /// The axis is polar, not angular. This is an algebraic line/axis
+    /// intersection, never a small sampled orbit or derivative.
+    pub cone_apex: Option<(Axis, f64)>,
 }
 
 impl CertifiedLattice {
@@ -162,6 +166,7 @@ impl CertifiedLattice {
     pub const NON_PERIODIC: Self = Self {
         u: AxisPeriodStatus::NonPeriodic,
         v: AxisPeriodStatus::NonPeriodic,
+        cone_apex: None,
     };
 
     /// The exact angular period of a surface of revolution, on the axis the
@@ -175,10 +180,12 @@ impl CertifiedLattice {
             Axis::U => Self {
                 u: exact,
                 v: generatrix,
+                cone_apex: None,
             },
             Axis::V => Self {
                 u: generatrix,
                 v: exact,
+                cone_apex: None,
             },
         }
     }
@@ -198,10 +205,12 @@ impl CertifiedLattice {
             Axis::U => Self {
                 u: exact,
                 v: AxisPeriodStatus::NonPeriodic,
+                cone_apex: None,
             },
             Axis::V => Self {
                 u: AxisPeriodStatus::NonPeriodic,
                 v: exact,
+                cone_apex: None,
             },
         }
     }
@@ -213,6 +222,7 @@ impl CertifiedLattice {
         Self {
             u: AxisPeriodStatus::from_unevidenced_accessor(u),
             v: AxisPeriodStatus::from_unevidenced_accessor(v),
+            cone_apex: None,
         }
     }
 
@@ -226,6 +236,15 @@ impl CertifiedLattice {
         Self {
             u: self.v.identity(),
             v: self.u.identity(),
+            cone_apex: self.cone_apex.map(|(axis, p)| {
+                (
+                    match axis {
+                        Axis::U => Axis::V,
+                        Axis::V => Axis::U,
+                    },
+                    p,
+                )
+            }),
         }
     }
 

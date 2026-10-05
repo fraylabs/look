@@ -217,7 +217,11 @@ fn spline_lattice(surface: &Surface, closure: Option<SplineAxisClosure>) -> Cert
     };
     let u = spline_axis(Axis::U, closure.u_closed, (u0, u1));
     let v = spline_axis(Axis::V, closure.v_closed, (v0, v1));
-    CertifiedLattice { u, v }
+    CertifiedLattice {
+        u,
+        v,
+        cone_apex: None,
+    }
 }
 
 /// How many samples per axis the seam compatibility check evaluates.
@@ -339,9 +343,42 @@ fn elementary_lattice(surface: &ElementarySurface) -> CertifiedLattice {
         // entity's generatrix axis. Every axis-indexed fact is therefore
         // restated in the caller's convention, or the exact `2π` would land on
         // the wrong axis — an error the bare accessors could not express.
-        ElementarySurface::CylindricalSurface(processor)
-        | ElementarySurface::ConicalSurface(processor) => {
+        ElementarySurface::CylindricalSurface(processor) => {
             let lattice = CertifiedLattice::revolution(Axis::V, AxisPeriodStatus::NonPeriodic);
+            orient(lattice, processor.orientation())
+        }
+
+        ElementarySurface::ConicalSurface(processor) => {
+            use truck_meshalgo::prelude::InnerSpace;
+            let entity = processor.entity();
+            let axis = entity.axis();
+            let line = entity.entity_curve();
+            let a = line.0 - entity.origin();
+            let d = line.1 - line.0;
+            let radial = |x: truck_meshalgo::prelude::Vector3| x - axis * x.dot(axis);
+            let (r, dr) = (radial(a), radial(d));
+            let mut lattice = CertifiedLattice::revolution(Axis::V, AxisPeriodStatus::NonPeriodic);
+            if [r.x, r.y, r.z, dr.x, dr.y, dr.z, axis.x, axis.y, axis.z]
+                .into_iter()
+                .all(f64::is_finite)
+                && dr.magnitude2().is_finite()
+                && dr.magnitude2() > 0.0
+                && d.dot(axis).is_finite()
+                && d.dot(axis) != 0.0
+            {
+                let apex = -r.dot(dr) / dr.magnitude2();
+                // The source names a cone; reject an incompatible converted
+                // generator instead of certifying a nearby hyperboloid.
+                let error = (r + apex * dr).magnitude();
+                let scale = r.magnitude() + apex.abs() * dr.magnitude();
+                if apex.is_finite()
+                    && error.is_finite()
+                    && scale.is_finite()
+                    && error <= 64.0 * f64::EPSILON * scale
+                {
+                    lattice.cone_apex = Some((Axis::U, apex));
+                }
+            }
             orient(lattice, processor.orientation())
         }
 
@@ -1076,6 +1113,30 @@ mod schema_tests {
             Point3::new(2.0, 2.0, 3.0),
             Point3::new(1.0, 3.0, 3.0),
         )))
+    }
+
+    #[test]
+    fn concrete_cone_apex_certificate_preserves_axis_convention() {
+        use truck_geometry::prelude::{Line, RevolutedCurve};
+        use truck_meshalgo::prelude::Invertible;
+        let cone = RevolutedCurve::by_revolution(
+            Line(Point3::new(-0.2, 0.0, -0.2), Point3::new(1.2, 0.0, 1.2)),
+            Point3::origin(),
+            Vector3::unit_z(),
+        );
+        let mut processor = Processor::new(cone);
+        let lattice = elementary_lattice(&ElementarySurface::ConicalSurface(processor.clone()));
+        let (axis, parameter) = lattice.cone_apex.expect("concrete cone apex");
+        assert_eq!(axis, Axis::U);
+        assert!((parameter - 1.0 / 7.0).abs() < 1e-14);
+        processor.invert();
+        let inverted = elementary_lattice(&ElementarySurface::ConicalSurface(processor));
+        assert_eq!(inverted.cone_apex, Some((Axis::V, parameter)));
+        assert!(
+            CertifiedLattice::revolution(Axis::V, AxisPeriodStatus::NonPeriodic)
+                .cone_apex
+                .is_none()
+        );
     }
 
     #[test]
