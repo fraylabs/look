@@ -368,6 +368,75 @@ impl PolicySurface {
             && (self.v_quotient.is_some() || in_range(uv.1, v0, v1))
     }
 
+    /// Preserve the source chart representative whenever the old inverse is
+    /// already accurate. Only a missing or physically inaccurate cone inverse
+    /// needs the analytic recovery; rounding a good root can alter its trim.
+    fn prefer_conical_inverse(
+        &self,
+        point: Point3,
+        hint: SPHint2D,
+        original: Option<(f64, f64)>,
+    ) -> Option<(f64, f64)> {
+        if !matches!(
+            self.inner,
+            Surface::ElementarySurface(ElementarySurface::ConicalSurface(_))
+        ) {
+            return original;
+        }
+        if original.is_some_and(|uv| {
+            (self.inner.subs(uv.0, uv.1) - point).magnitude() <= truck_meshalgo::prelude::TOLERANCE
+        }) {
+            return original;
+        }
+        self.conical_inverse(point, hint).or(original)
+    }
+
+    fn conical_inverse(&self, point: Point3, hint: SPHint2D) -> Option<(f64, f64)> {
+        use truck_meshalgo::prelude::{SquareMatrix, Transform};
+        let Surface::ElementarySurface(ElementarySurface::ConicalSurface(processor)) = &self.inner
+        else {
+            return None;
+        };
+        let local = processor.transform().invert()?.transform_point(point);
+        let cone = processor.entity();
+        let line = cone.entity_curve();
+        let axis = cone.axis();
+        let dz = (line.1 - line.0).dot(axis);
+        if !dz.is_finite() || dz.abs() <= f64::EPSILON * (line.1 - line.0).magnitude() {
+            return None;
+        }
+        // The axial coordinate of a straight conical generator determines its
+        // parameter uniquely. Solving its folded radial projection with Newton
+        // can instead settle on the opposite nappe after an apex hint.
+        let u = (local - line.0).dot(axis) / dz;
+        let radial = |p: Point3| {
+            let r = p - cone.origin();
+            r - r.dot(axis) * axis
+        };
+        let a = radial(line.0 + (line.1 - line.0) * u);
+        let b = radial(local);
+        let v = if a.magnitude2() <= truck_meshalgo::prelude::TOLERANCE.powi(2)
+            && b.magnitude2() <= truck_meshalgo::prelude::TOLERANCE.powi(2)
+        {
+            match (hint, processor.orientation()) {
+                (SPHint2D::Parameter(_, v), true) | (SPHint2D::Parameter(v, _), false) => v,
+                _ => 0.0,
+            }
+        } else {
+            a.cross(b).dot(axis).atan2(a.dot(b))
+        };
+        let uv = if processor.orientation() {
+            (u, v)
+        } else {
+            (v, u)
+        };
+        (u.is_finite()
+            && v.is_finite()
+            && (self.inner.subs(uv.0, uv.1) - point).magnitude()
+                <= truck_meshalgo::prelude::TOLERANCE)
+            .then_some(uv)
+    }
+
     fn native_control_hull_distance(&self, point: Point3) -> Option<f64> {
         let (min, max) = (*self
             .native_control_hull
@@ -768,7 +837,9 @@ impl SearchParameter<D2> for PolicySurface {
         // value onto the boundary. For an ordinary spline, prefer an equally
         // accurate native root before retaining the legacy result
         // (`accept_inverse_result` applies no bound).
-        let uv = self.inner.search_parameter(point, hint, trials)?;
+        let hint = hint.into();
+        let original = self.inner.search_parameter(point, hint, trials);
+        let uv = self.prefer_conical_inverse(point, hint, original)?;
         let uv = self.prefer_native_inverse(point, uv, trials);
         self.accept_inverse_result(uv).then_some(uv)
     }
@@ -792,7 +863,9 @@ impl SearchNearestParameter<D2> for PolicySurface {
         hint: H,
         trials: usize,
     ) -> Option<(f64, f64)> {
-        let uv = self.inner.search_nearest_parameter(point, hint, trials)?;
+        let hint = hint.into();
+        let original = self.inner.search_nearest_parameter(point, hint, trials);
+        let uv = self.prefer_conical_inverse(point, hint, original)?;
         let uv = self.prefer_native_inverse(point, uv, trials);
         self.accept_inverse_result(uv).then_some(uv)
     }
@@ -1134,6 +1207,139 @@ mod quotient_tests {
             column(0.7, 1.5),
         ];
         Surface::BSplineSurface(BSplineSurface::new(knots, control_points))
+    }
+
+    #[test]
+    fn conical_recovery_respects_scaled_transformed_and_inverted_carriers() {
+        use truck_geometry::prelude::{Line, Processor, RevolutedCurve};
+        use truck_meshalgo::prelude::Invertible;
+        for scale in [0.001, 1.0, 1000.0] {
+            for inverted in [false, true] {
+                let entity = RevolutedCurve::by_revolution(
+                    Line(Point3::new(-0.4, 0.0, -1.4), Point3::new(2.4, 0.0, 0.2)),
+                    Point3::new(0.0, 0.0, 0.0),
+                    Vector3::unit_z(),
+                );
+                let transform = truck_meshalgo::prelude::Matrix4::from_translation(Vector3::new(
+                    7.0, -4.0, 11.0,
+                )) * truck_meshalgo::prelude::Matrix4::from_angle_y(
+                    truck_meshalgo::prelude::Rad(0.37),
+                ) * truck_meshalgo::prelude::Matrix4::from_nonuniform_scale(
+                    scale,
+                    scale * 1.5,
+                    scale * 0.75,
+                );
+                let mut processor = Processor::with_transform(entity, transform);
+                if inverted {
+                    processor.invert();
+                }
+                let wrapped = PolicySurface::new(
+                    Surface::ElementarySurface(ElementarySurface::ConicalSurface(processor)),
+                    MeshingPolicy::DEFAULT,
+                    false,
+                );
+                let (uv, hint) = if inverted {
+                    ((0.4, 0.19), (std::f64::consts::PI, 1.0 / 7.0))
+                } else {
+                    ((0.19, 0.4), (1.0 / 7.0, std::f64::consts::PI))
+                };
+                let point = wrapped.subs(uv.0, uv.1);
+                for inverse in [
+                    wrapped.search_parameter(point, hint, 100),
+                    wrapped.search_nearest_parameter(point, hint, 100),
+                ] {
+                    let inverse = inverse.expect("a transformed on-carrier point is recoverable");
+                    assert!(
+                        (wrapped.subs(inverse.0, inverse.1) - point).magnitude()
+                            <= truck_meshalgo::prelude::TOLERANCE
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn conical_recovery_keeps_off_carrier_nearest_fallback() {
+        use truck_geometry::prelude::{Line, Processor, RevolutedCurve};
+        let wrapped = PolicySurface::new(
+            Surface::ElementarySurface(ElementarySurface::ConicalSurface(Processor::new(
+                RevolutedCurve::by_revolution(
+                    Line(Point3::new(-0.4, 0.0, -1.4), Point3::new(2.4, 0.0, 0.2)),
+                    Point3::new(0.0, 0.0, 0.0),
+                    Vector3::unit_z(),
+                ),
+            ))),
+            MeshingPolicy::DEFAULT,
+            false,
+        );
+        let point = wrapped.subs(0.8, 0.4) + Vector3::new(0.0, 0.0, 0.1);
+        let original = wrapped
+            .inner
+            .search_nearest_parameter(point, (0.8, 0.4), 100);
+        assert!(original.is_some());
+        assert!(wrapped.conical_inverse(point, (0.8, 0.4).into()).is_none());
+        assert_eq!(
+            wrapped.search_nearest_parameter(point, (0.8, 0.4), 100),
+            original
+        );
+    }
+
+    #[test]
+    fn accurate_conical_inverse_keeps_the_existing_chart_representative() {
+        use truck_geometry::prelude::{Line, Processor, RevolutedCurve};
+        let cone = Processor::new(RevolutedCurve::by_revolution(
+            Line(Point3::new(-0.4, 0.0, -1.4), Point3::new(2.4, 0.0, 0.2)),
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::unit_z(),
+        ));
+        let wrapped = PolicySurface::new(
+            Surface::ElementarySurface(ElementarySurface::ConicalSurface(cone)),
+            MeshingPolicy::DEFAULT,
+            false,
+        );
+        for u in [0.2, 0.37, 0.8] {
+            for v in [-2.7, -0.6, 0.6, 2.7] {
+                let point = wrapped.subs(u, v);
+                let original = wrapped
+                    .inner
+                    .search_nearest_parameter(point, (u, v), 100)
+                    .unwrap();
+                assert!(
+                    (wrapped.subs(original.0, original.1) - point).magnitude()
+                        <= truck_meshalgo::prelude::TOLERANCE
+                );
+                let actual = wrapped
+                    .search_nearest_parameter(point, (u, v), 100)
+                    .unwrap();
+                assert_eq!(
+                    actual, original,
+                    "an accurate chart representative must not be replaced"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn conical_inverse_from_apex_hint_keeps_boundary_point_on_carrier() {
+        use truck_geometry::prelude::{Line, Processor, RevolutedCurve};
+        let cone = Processor::new(RevolutedCurve::by_revolution(
+            Line(Point3::new(-0.4, 0.0, -1.4), Point3::new(2.4, 0.0, 0.2)),
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::unit_z(),
+        ));
+        let wrapped = PolicySurface::new(
+            Surface::ElementarySurface(ElementarySurface::ConicalSurface(cone)),
+            MeshingPolicy::DEFAULT,
+            false,
+        );
+        let point = wrapped.subs(0.19, 0.0);
+        let inverse = wrapped
+            .search_nearest_parameter(point, (1.0 / 7.0, std::f64::consts::PI), 100)
+            .expect("a regular point on the cone has an inverse");
+        assert!(
+            (wrapped.subs(inverse.0, inverse.1) - point).magnitude() < 1.0e-6,
+            "an apex hint selected the wrong nappe: {inverse:?}"
+        );
     }
 
     #[test]
