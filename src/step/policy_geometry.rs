@@ -269,6 +269,7 @@ pub struct PolicySurface {
     u_quotient: Option<QuotientAxis>,
     /// The cover→native evaluator quotient on the `v` axis, when certified.
     v_quotient: Option<QuotientAxis>,
+    native_control_hull: std::sync::OnceLock<Option<(Point3, Point3)>>,
 }
 
 impl PolicySurface {
@@ -281,6 +282,7 @@ impl PolicySurface {
             source_closure: None,
             u_quotient: None,
             v_quotient: None,
+            native_control_hull: std::sync::OnceLock::new(),
         }
     }
 
@@ -314,6 +316,7 @@ impl PolicySurface {
             source_closure,
             u_quotient,
             v_quotient,
+            native_control_hull: std::sync::OnceLock::new(),
         }
     }
 
@@ -365,6 +368,64 @@ impl PolicySurface {
             && (self.v_quotient.is_some() || in_range(uv.1, v0, v1))
     }
 
+    fn native_control_hull_distance(&self, point: Point3) -> Option<f64> {
+        let (min, max) = (*self
+            .native_control_hull
+            .get_or_init(|| self.compute_native_control_hull()))?;
+        Some(
+            (0..3)
+                .map(|axis| {
+                    let delta = (min[axis] - point[axis])
+                        .max(point[axis] - max[axis])
+                        .max(0.0);
+                    delta * delta
+                })
+                .sum::<f64>()
+                .sqrt(),
+        )
+    }
+
+    fn compute_native_control_hull(&self) -> Option<(Point3, Point3)> {
+        let points: Vec<Point3> = match &self.inner {
+            Surface::BSplineSurface(s) => s.control_points().iter().flatten().copied().collect(),
+            Surface::NurbsSurface(s) => {
+                let controls = s.control_points().iter().flatten();
+                if controls.clone().any(|p| !p.w.is_finite() || p.w <= 0.0) {
+                    return None;
+                }
+                controls
+                    .map(|p| Point3::new(p.x / p.w, p.y / p.w, p.z / p.w))
+                    .collect()
+            }
+            _ => return None,
+        };
+        if points.is_empty()
+            || points
+                .iter()
+                .any(|p| !p.x.is_finite() || !p.y.is_finite() || !p.z.is_finite())
+        {
+            return None;
+        }
+        let mut min = points[0];
+        let mut max = min;
+        for p in points {
+            for axis in 0..3 {
+                min[axis] = min[axis].min(p[axis]);
+                max[axis] = max[axis].max(p[axis]);
+            }
+        }
+        Some((min, max))
+    }
+
+    fn inverse_is_strictly_native(&self, uv: (f64, f64)) -> bool {
+        let ((u0, u1), (v0, v1)) = match &self.inner {
+            Surface::BSplineSurface(s) => BoundedSurface::evaluation_range(s),
+            Surface::NurbsSurface(s) => BoundedSurface::evaluation_range(s),
+            _ => return true,
+        };
+        uv.0 >= u0 && uv.0 <= u1 && uv.1 >= v0 && uv.1 <= v1
+    }
+
     fn prefer_native_inverse(&self, point: Point3, uv: (f64, f64), trials: usize) -> (f64, f64) {
         if self.u_quotient.is_some()
             || self.v_quotient.is_some()
@@ -377,15 +438,42 @@ impl PolicySurface {
         // equally accurate native-domain root, without rejecting legacy faces
         // for which the source admits only an exterior inverse.
         let residual = (self.inner.subs(uv.0, uv.1) - point).magnitude();
-        let candidates =
-            std::iter::once(None).chain(self.inner.search_parameter_seeds().into_iter().map(Some));
-        for hint in candidates {
+        // On the active knot domain, polynomial splines and positive-weight
+        // rational splines lie in their control hull. A point farther from
+        // that hull than the accepted residual cannot have a qualifying root.
+        // New roots must be strictly native for this bound to apply; the
+        // existing padded-domain acceptance of the original root is unchanged.
+        if self
+            .native_control_hull_distance(point)
+            .is_some_and(|distance| distance > residual + truck_meshalgo::prelude::TOLERANCE)
+        {
+            return uv;
+        }
+        let ((u0, u1), (v0, v1)) = match &self.inner {
+            Surface::BSplineSurface(s) => BoundedSurface::evaluation_range(s),
+            Surface::NurbsSurface(s) => BoundedSurface::evaluation_range(s),
+            _ => return uv,
+        };
+        if ![u0, u1, v0, v1].iter().all(|x| x.is_finite()) || u1 <= u0 || v1 <= v0 {
+            return uv;
+        }
+        // Keep the original inverse as a locality hint, but start Newton on
+        // the native chart. Only the starting guess is projected: the result
+        // must independently satisfy the domain and physical residual checks.
+        // A central start covers a singular boundary derivative without the
+        // full native-grid presearch or a retry for every knot-span cell.
+        let seeds = [
+            (uv.0.clamp(u0, u1), uv.1.clamp(v0, v1)),
+            ((u0 + u1) / 2.0, (v0 + v1) / 2.0),
+        ];
+        for seed in seeds {
+            let hint = Some(seed);
             let candidate = self
                 .inner
                 .search_parameter(point, hint, trials)
                 .or_else(|| self.inner.search_nearest_parameter(point, hint, trials));
             if let Some(candidate) = candidate {
-                if self.inverse_is_in_native_domain(candidate)
+                if self.inverse_is_strictly_native(candidate)
                     && (self.inner.subs(candidate.0, candidate.1) - point).magnitude()
                         <= residual + truck_meshalgo::prelude::TOLERANCE
                 {
