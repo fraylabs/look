@@ -735,7 +735,7 @@ fn mesh_shell(
         closure_map,
         signed_torus_surfaces,
     )
-    .robust_triangulation_with_torus_outcome(
+    .robust_triangulation_with_inverse_retry_outcome(
         tolerance,
         |s: &policy_geometry::PolicySurface| {
             lattice::lattice_of_with_closure(s.inner(), s.source_closure())
@@ -747,6 +747,7 @@ fn mesh_shell(
         |c: &policy_geometry::PolicyCurve| lattice::cylinder_curve_family_of(c.inner()),
         |s: &policy_geometry::PolicySurface| cone::identify_source_cone_opt(s.inner()),
         |s: &policy_geometry::PolicySurface| torus_deck::identify_source_torus_opt(s.inner()),
+        |s: &policy_geometry::PolicySurface| s.native_inverse_retry(),
     );
     let meshed = outcome.shell;
     // A face that could not be meshed is dropped from the polygon

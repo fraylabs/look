@@ -485,6 +485,28 @@ pub trait LatticeMeshableShape<S, C> {
         torus_of: impl Fn(&S) -> std::result::Result<formal::CertifiedEmbeddedTorus, &'static str>
             + Parallelizable,
     ) -> MeshedShellOutcome;
+
+    /// Retry an unresolved contradictory trim with a caller-provided search
+    /// adapter, after all established recovery routes refuse. Successful faces
+    /// never call this adapter. It must preserve the source carrier and lattice;
+    /// the kernel reuses the shell's canonical physical edge polylines.
+    #[allow(clippy::too_many_arguments)]
+    fn robust_triangulation_with_inverse_retry_outcome(
+        &self,
+        tol: f64,
+        lattice_of: impl Fn(&S) -> CertifiedLattice + Parallelizable,
+        schema_of: impl Fn(&S) -> formal::SupportSurfaceSchema + Parallelizable,
+        curve_schema_of: impl Fn(&C) -> formal::CurveSchema + Parallelizable,
+        cylinder_of: impl Fn(&S) -> std::result::Result<formal::CertifiedEmbeddedCylinder, &'static str>
+            + Parallelizable,
+        cylinder_curve_schema_of: impl Fn(&C) -> formal::CurveSchema + Parallelizable,
+        cylinder_curve_family_of: impl Fn(&C) -> Option<formal::SourceCurveFamily> + Parallelizable,
+        cone_of: impl Fn(&S) -> std::result::Result<formal::CertifiedEmbeddedCone, &'static str>
+            + Parallelizable,
+        torus_of: impl Fn(&S) -> std::result::Result<formal::CertifiedEmbeddedTorus, &'static str>
+            + Parallelizable,
+        inverse_retry: impl Fn(&S) -> Option<S> + Parallelizable,
+    ) -> MeshedShellOutcome;
 }
 
 impl<C: PolylineableCurve, S: RobustMeshableSurface> LatticeMeshableShape<S, C>
@@ -616,6 +638,36 @@ impl<C: PolylineableCurve, S: RobustMeshableSurface> LatticeMeshableShape<S, C>
         torus_of: impl Fn(&S) -> std::result::Result<formal::CertifiedEmbeddedTorus, &'static str>
             + Parallelizable,
     ) -> MeshedShellOutcome {
+        self.robust_triangulation_with_inverse_retry_outcome(
+            tol,
+            lattice_of,
+            schema_of,
+            curve_schema_of,
+            cylinder_of,
+            cylinder_curve_schema_of,
+            cylinder_curve_family_of,
+            cone_of,
+            torus_of,
+            |_| None,
+        )
+    }
+
+    fn robust_triangulation_with_inverse_retry_outcome(
+        &self,
+        tol: f64,
+        lattice_of: impl Fn(&S) -> CertifiedLattice + Parallelizable,
+        schema_of: impl Fn(&S) -> formal::SupportSurfaceSchema + Parallelizable,
+        curve_schema_of: impl Fn(&C) -> formal::CurveSchema + Parallelizable,
+        cylinder_of: impl Fn(&S) -> std::result::Result<formal::CertifiedEmbeddedCylinder, &'static str>
+            + Parallelizable,
+        cylinder_curve_schema_of: impl Fn(&C) -> formal::CurveSchema + Parallelizable,
+        cylinder_curve_family_of: impl Fn(&C) -> Option<formal::SourceCurveFamily> + Parallelizable,
+        cone_of: impl Fn(&S) -> std::result::Result<formal::CertifiedEmbeddedCone, &'static str>
+            + Parallelizable,
+        torus_of: impl Fn(&S) -> std::result::Result<formal::CertifiedEmbeddedTorus, &'static str>
+            + Parallelizable,
+        inverse_retry: impl Fn(&S) -> Option<S> + Parallelizable,
+    ) -> MeshedShellOutcome {
         nonpositive_tolerance!(tol);
         triangulation::cshell_tessellation_with_outcomes_and_torus(
             self,
@@ -629,6 +681,7 @@ impl<C: PolylineableCurve, S: RobustMeshableSurface> LatticeMeshableShape<S, C>
             cylinder_curve_family_of,
             cone_of,
             torus_of,
+            inverse_retry,
         )
     }
 }

@@ -1499,6 +1499,7 @@ where
         |_: &S| -> std::result::Result<formal::CertifiedEmbeddedTorus, &'static str> {
             Err("torus_evidence_not_provided")
         },
+        |_| None,
     )
 }
 
@@ -1532,6 +1533,7 @@ pub(super) fn cshell_tessellation_with_outcomes_and_torus<'a, C, S>(
         + Parallelizable,
     torus_of: impl Fn(&S) -> std::result::Result<formal::CertifiedEmbeddedTorus, &'static str>
         + Parallelizable,
+    inverse_retry: impl Fn(&S) -> Option<S> + Parallelizable,
 ) -> MeshedShellOutcome
 where
     C: PolylineableCurve + 'a,
@@ -1549,6 +1551,7 @@ where
         cylinder_curve_family_of,
         cone_of,
         torus_of,
+        inverse_retry,
     )
 }
 
@@ -1600,6 +1603,7 @@ where
         |_: &S| -> std::result::Result<formal::CertifiedEmbeddedTorus, &'static str> {
             Err("torus_evidence_not_provided")
         },
+        |_| None,
     )
 }
 
@@ -1718,6 +1722,7 @@ fn cshell_tessellation_inner<'a, C, S>(
         + Parallelizable,
     torus_of: impl Fn(&S) -> std::result::Result<formal::CertifiedEmbeddedTorus, &'static str>
         + Parallelizable,
+    inverse_retry: impl Fn(&S) -> Option<S> + Parallelizable,
 ) -> MeshedShellOutcome
 where
     C: PolylineableCurve + 'a,
@@ -2178,56 +2183,60 @@ where
                 &schema,
             );
         }
-        let create_boundary = |(bound_index, wire): (usize, &Vec<CompressedEdgeIndex>)| {
-            let bound = BoundId(bound_index);
-            // Each wire item becomes a tagged polyline: the curve exactly as
-            // `create_edge` produced it before, plus the synthetic source
-            // identity `(BoundId(bound_index), use_index, orientation)` that is
-            // the last cheap provenance this seam still has.
-            //
-            // A wire that references an edge with no established source
-            // traversal fails the boundary outright: dropping that edge would
-            // let the remaining samples close over the missing arc, which is
-            // exactly the invented geometry `Unresolved` exists to refuse.
-            let mut wire_iter = Vec::with_capacity(wire.len());
-            for (use_index, edge_idx) in wire.iter().enumerate() {
-                let edge = match edges.get(edge_idx.index) {
-                    Some(EstablishedEdge::Mesh(edge)) => edge,
-                    Some(EstablishedEdge::Unresolved { .. }) => {
-                        // DIAG-002: the source-edge traversal refusal witness.
-                        // The failing bound and edge use are in hand here; the
-                        // caller tolerance and the source's declared geometric
-                        // uncertainty are the operative numbers.
-                        diagnosis::record_source_edge_refusal(diagnosis::SourceEdgeWitness {
-                            source_bound: Some(bound_index),
-                            source_edge_use: Some(use_index),
-                            endpoint_residuals: None,
-                            declared_source_uncertainty: shell.source_geometric_uncertainty,
-                            effective_incidence_tolerance: None,
-                            caller_tolerance: Some(tol),
-                            carrier_closure: None,
-                        });
-                        return Err(TessellationFailureReason::EdgeTraversalUnresolved);
-                    }
-                    None => continue,
-                };
-                let curve = match edge_idx.orientation {
-                    true => edge.curve.clone(),
-                    false => edge.curve.inverse(),
-                };
-                wire_iter.push(SourcePolyline {
-                    curve,
-                    source: SourceEdgeUse {
-                        bound,
-                        index: use_index,
-                        orientation: edge_idx.orientation,
-                    },
-                });
-            }
-            PolyBoundaryPiece::try_new(surface, wire_iter.into_iter(), &sp, tol, &lattice)
-        };
-        let preboundary: std::result::Result<Vec<_>, _> =
-            boundaries.iter().enumerate().map(create_boundary).collect();
+        let create_boundary =
+            |surface: &S, (bound_index, wire): (usize, &Vec<CompressedEdgeIndex>)| {
+                let bound = BoundId(bound_index);
+                // Each wire item becomes a tagged polyline: the curve exactly as
+                // `create_edge` produced it before, plus the synthetic source
+                // identity `(BoundId(bound_index), use_index, orientation)` that is
+                // the last cheap provenance this seam still has.
+                //
+                // A wire that references an edge with no established source
+                // traversal fails the boundary outright: dropping that edge would
+                // let the remaining samples close over the missing arc, which is
+                // exactly the invented geometry `Unresolved` exists to refuse.
+                let mut wire_iter = Vec::with_capacity(wire.len());
+                for (use_index, edge_idx) in wire.iter().enumerate() {
+                    let edge = match edges.get(edge_idx.index) {
+                        Some(EstablishedEdge::Mesh(edge)) => edge,
+                        Some(EstablishedEdge::Unresolved { .. }) => {
+                            // DIAG-002: the source-edge traversal refusal witness.
+                            // The failing bound and edge use are in hand here; the
+                            // caller tolerance and the source's declared geometric
+                            // uncertainty are the operative numbers.
+                            diagnosis::record_source_edge_refusal(diagnosis::SourceEdgeWitness {
+                                source_bound: Some(bound_index),
+                                source_edge_use: Some(use_index),
+                                endpoint_residuals: None,
+                                declared_source_uncertainty: shell.source_geometric_uncertainty,
+                                effective_incidence_tolerance: None,
+                                caller_tolerance: Some(tol),
+                                carrier_closure: None,
+                            });
+                            return Err(TessellationFailureReason::EdgeTraversalUnresolved);
+                        }
+                        None => continue,
+                    };
+                    let curve = match edge_idx.orientation {
+                        true => edge.curve.clone(),
+                        false => edge.curve.inverse(),
+                    };
+                    wire_iter.push(SourcePolyline {
+                        curve,
+                        source: SourceEdgeUse {
+                            bound,
+                            index: use_index,
+                            orientation: edge_idx.orientation,
+                        },
+                    });
+                }
+                PolyBoundaryPiece::try_new(surface, wire_iter.into_iter(), &sp, tol, &lattice)
+            };
+        let preboundary: std::result::Result<Vec<_>, _> = boundaries
+            .iter()
+            .enumerate()
+            .map(|bound| create_boundary(surface, bound))
+            .collect();
         // G8: the same computation as before, with the failure kept rather than
         // flattened into an empty mesh.
         //
@@ -2865,6 +2874,35 @@ where
                 }
             }
             _ => (polygon, failure),
+        };
+        // Search refinement is last and failure-only. Canonical source edge
+        // samples are reused; a healthy face is neither re-lifted nor re-meshed.
+        // Refused retries preserve the original diagnostic, and a successful
+        // retry emits no premature final failure record.
+        let (polygon, failure) = if failure
+            .as_ref()
+            .is_some_and(|f| f.reason == TessellationFailureReason::ContradictoryDualParity)
+        {
+            let _suspension = diagnosis::SinkSuspension::new();
+            let recovered = inverse_retry(surface).and_then(|retry_surface| {
+                let pieces: std::result::Result<Vec<_>, _> = boundaries
+                    .iter()
+                    .enumerate()
+                    .map(|bound| create_boundary(&retry_surface, bound))
+                    .collect();
+                let pieces = pieces.ok()?;
+                if detect_degenerate_trim(&pieces, &retry_surface).is_some() {
+                    return None;
+                }
+                let boundary = PolyBoundary::new(pieces, &retry_surface, tol, &lattice);
+                trimming_tessellation_result(&retry_surface, &boundary, tol, &lattice).ok()
+            });
+            match recovered {
+                Some(mesh) => (Some(mesh), None),
+                None => (polygon, failure),
+            }
+        } else {
+            (polygon, failure)
         };
         PROBE_FACE_CONTEXT.with(|context| context.set((None, usize::MAX, 0)));
         // The single terminal finalizer: exactly one record per face that ends

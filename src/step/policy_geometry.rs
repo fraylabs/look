@@ -269,6 +269,7 @@ pub struct PolicySurface {
     u_quotient: Option<QuotientAxis>,
     /// The cover→native evaluator quotient on the `v` axis, when certified.
     v_quotient: Option<QuotientAxis>,
+    native_inverse_recovery: bool,
     native_control_hull: std::sync::OnceLock<Option<(Point3, Point3)>>,
 }
 
@@ -282,6 +283,7 @@ impl PolicySurface {
             source_closure: None,
             u_quotient: None,
             v_quotient: None,
+            native_inverse_recovery: false,
             native_control_hull: std::sync::OnceLock::new(),
         }
     }
@@ -316,8 +318,26 @@ impl PolicySurface {
             source_closure,
             u_quotient,
             v_quotient,
+            native_inverse_recovery: false,
             native_control_hull: std::sync::OnceLock::new(),
         }
+    }
+
+    /// A search-only retry for an ordinary spline whose original trim refused.
+    /// The carrier, lattice and physical boundary samples stay unchanged.
+    pub fn native_inverse_retry(&self) -> Option<Self> {
+        if self.u_quotient.is_some()
+            || self.v_quotient.is_some()
+            || !matches!(
+                self.inner,
+                Surface::BSplineSurface(_) | Surface::NurbsSurface(_)
+            )
+        {
+            return None;
+        }
+        let mut retry = self.clone();
+        retry.native_inverse_recovery = true;
+        Some(retry)
     }
 
     /// The underlying STEP surface, for the identification callbacks.
@@ -470,17 +490,22 @@ impl PolicySurface {
             return uv;
         }
         let spans = (u1 - u0, v1 - v0);
+        if !self.inverse_has_regular_jacobian(uv, spans) {
+            return uv;
+        }
         // Keep the original inverse as a locality hint, but start Newton on
         // the native chart. Only the starting guess is projected: the result
         // must independently satisfy the domain and physical residual checks.
-        // A central start covers a singular boundary derivative without the
-        // full native-grid presearch or a retry for every knot-span cell.
+        // A central start is a cheap second attempt. These two starts need not
+        // reach another turn of a long spline strip, so failure must still
+        // admit the native presearch and the source knot-span cells below.
         let seeds = [
             (uv.0.clamp(u0, u1), uv.1.clamp(v0, v1)),
             ((u0 + u1) / 2.0, (v0 + v1) / 2.0),
         ];
-        for seed in seeds {
-            let hint = Some(seed);
+        let original_normal =
+            (self.inner.uder(uv.0, uv.1) * spans.0).cross(self.inner.vder(uv.0, uv.1) * spans.1);
+        let try_hint = |hint, preserve_orientation: bool| {
             let candidate = self
                 .inner
                 .search_parameter(point, hint, trials)
@@ -489,14 +514,40 @@ impl PolicySurface {
                 if self.inverse_is_strictly_native(candidate)
                     && (self.inner.subs(candidate.0, candidate.1) - point).magnitude()
                         <= residual + truck_meshalgo::prelude::TOLERANCE
-                    && self.inverse_has_regular_jacobian(uv, spans)
                     && self.inverse_has_regular_jacobian(candidate, spans)
+                    && (!preserve_orientation
+                        || original_normal.dot(
+                            (self.inner.uder(candidate.0, candidate.1) * spans.0)
+                                .cross(self.inner.vder(candidate.0, candidate.1) * spans.1),
+                        ) > 0.0)
                 {
-                    return candidate;
+                    return Some(candidate);
                 }
             }
+            None
+        };
+        if let Some(candidate) = seeds
+            .into_iter()
+            .find_map(|seed| try_hint(Some(seed), false))
+        {
+            return candidate;
         }
-        uv
+        // A successful trim owns its existing chart. Remote roots become
+        // eligible only on the kernel's typed, failed-face retry path.
+        if !self.native_inverse_recovery {
+            return uv;
+        }
+        // Build the broader starts only after the local attempts fail. Keep
+        // the same residual, native-domain and Jacobian requirements: the
+        // fallback finds a chart representative, never moves a source point.
+        // Unlike the established local starts, a remote cell can lie on a
+        // different regular sheet of a folded carrier. Equal positions and
+        // full-rank derivatives do not authorize reversing that sheet's
+        // orientation; preserve the original normal hemisphere here.
+        std::iter::once(None)
+            .chain(self.inner.search_parameter_seeds().into_iter().map(Some))
+            .find_map(|hint| try_hint(hint, true))
+            .unwrap_or(uv)
     }
 
     /// Whether a final parameter-inverse result is a valid representative.
@@ -1159,6 +1210,128 @@ mod quotient_tests {
             .expect("an in-domain root exists");
         assert!((0.0..=1.0).contains(&uv.0), "escaped native domain: {uv:?}");
         assert!((wrapped.subs(uv.0, uv.1) - point).magnitude() < 1.0e-6);
+    }
+
+    #[test]
+    fn ordinary_spline_inverse_finds_native_cell_on_multi_turn_strip() {
+        // Authored eight-turn helical strip: a translation by 0.1*u in z
+        // gives each physical point an exact exterior representative one
+        // turn earlier. The clamped old hint and the domain midpoint both
+        // find another turn; the native inverse lies in a remote knot cell.
+        let k = 4.0 * (2.0_f64.sqrt() - 1.0) / 3.0;
+        let quarters = [
+            [(1.0, 0.0), (1.0, k), (k, 1.0), (0.0, 1.0)],
+            [(0.0, 1.0), (-k, 1.0), (-1.0, k), (-1.0, 0.0)],
+            [(-1.0, 0.0), (-1.0, -k), (-k, -1.0), (0.0, -1.0)],
+            [(0.0, -1.0), (k, -1.0), (1.0, -k), (1.0, 0.0)],
+        ];
+        let mut points = Vec::new();
+        for segment in 0..32 {
+            for j in 0..3 {
+                let (x, y) = quarters[segment % 4][j];
+                points.push(Point3::new(x, y, (segment as f64 + j as f64 / 3.0) / 4.0));
+            }
+        }
+        points.push(Point3::new(1.0, 0.0, 8.0));
+        let mut knots = vec![0.0; 4];
+        for segment in 1..32 {
+            knots.extend([segment as f64 / 32.0; 3]);
+        }
+        knots.extend([1.0; 4]);
+        let rows = [0.0, 0.1]
+            .into_iter()
+            .map(|offset| {
+                points
+                    .iter()
+                    .map(|p| Point3::new(p.x, p.y, p.z + offset))
+                    .collect()
+            })
+            .collect();
+        let wrapped = PolicySurface::with_closure(
+            Surface::BSplineSurface(BSplineSurface::new(
+                (KnotVec::bezier_knot(1), KnotVec::from(knots)),
+                rows,
+            )),
+            MeshingPolicy::DEFAULT,
+            false,
+            Some(SplineAxisClosure::OPEN),
+        );
+        let native = (0.4, 0.82);
+        let exterior = (10.4, native.1 - 0.125);
+        let point = wrapped.subs(native.0, native.1);
+        assert!((wrapped.subs(exterior.0, exterior.1) - point).magnitude() < 1.0e-10);
+        assert_eq!(
+            wrapped.prefer_native_inverse(point, exterior, 100),
+            exterior,
+            "a face without a topology refusal changed its remote chart"
+        );
+        let wrapped = wrapped
+            .native_inverse_retry()
+            .expect("ordinary spline retry");
+        let actual = wrapped.prefer_native_inverse(point, exterior, 100);
+        assert!(
+            wrapped.inverse_is_in_native_domain(actual),
+            "native inverse missed: {actual:?}"
+        );
+        assert!((wrapped.subs(actual.0, actual.1) - point).magnitude() < 1.0e-6);
+    }
+
+    #[test]
+    fn ordinary_spline_remote_native_root_preserves_sheet_orientation() {
+        // The same physical point lies on two sheets of an authored folded
+        // helical strip. A remote native root reverses the regular carrier
+        // normal. A broad inverse fallback must preserve the original sheet
+        // when it lacks topological authority to select that other sheet.
+        let k = 4.0 * (2.0_f64.sqrt() - 1.0) / 3.0;
+        let quarters = [
+            [(1.0, 0.0), (1.0, k), (k, 1.0), (0.0, 1.0)],
+            [(0.0, 1.0), (-k, 1.0), (-1.0, k), (-1.0, 0.0)],
+            [(-1.0, 0.0), (-1.0, -k), (-k, -1.0), (0.0, -1.0)],
+            [(0.0, -1.0), (k, -1.0), (1.0, -k), (1.0, 0.0)],
+        ];
+        let mut points = Vec::new();
+        for segment in 0..32 {
+            for j in 0..3 {
+                let (x, y) = quarters[segment % 4][j];
+                points.push(Point3::new(x, y, (segment as f64 + j as f64 / 3.0) / 4.0));
+            }
+        }
+        points.push(Point3::new(1.0, 0.0, 8.0));
+        let mut knots = vec![0.0; 4];
+        for segment in 1..32 {
+            knots.extend([segment as f64 / 32.0; 3]);
+        }
+        knots.extend([1.0; 4]);
+        let rows = [0.0, 0.0, 1.0]
+            .into_iter()
+            .map(|offset| {
+                points
+                    .iter()
+                    .map(|p| Point3::new(p.x, p.y, p.z + offset))
+                    .collect()
+            })
+            .collect();
+        let wrapped = PolicySurface::with_closure(
+            Surface::BSplineSurface(BSplineSurface::new(
+                (KnotVec::bezier_knot(2), KnotVec::from(knots)),
+                rows,
+            )),
+            MeshingPolicy::DEFAULT,
+            false,
+            Some(SplineAxisClosure::OPEN),
+        );
+        let native = (0.4, 0.82);
+        let exterior = (-(1.0_f64 + native.0 * native.0).sqrt(), native.1 - 0.125);
+        let point = wrapped.subs(native.0, native.1);
+        assert!((wrapped.subs(exterior.0, exterior.1) - point).magnitude() < 1.0e-10);
+        let wrapped = wrapped
+            .native_inverse_retry()
+            .expect("ordinary spline retry");
+        let actual = wrapped.prefer_native_inverse(point, exterior, 100);
+        assert_eq!(
+            actual, exterior,
+            "a remote root changed the regular sheet orientation"
+        );
     }
 
     #[test]
